@@ -10,6 +10,97 @@ import (
 	"testing"
 )
 
+func TestTranslateToolChoice(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantOut    string // empty means nil
+		wantDrop   bool
+		wantErr    bool
+	}{
+		{name: "empty", in: ``, wantOut: ``},
+		{name: "auto string", in: `"auto"`, wantOut: `{"type":"auto"}`},
+		{name: "none string drops tools", in: `"none"`, wantOut: ``, wantDrop: true},
+		{name: "required string", in: `"required"`, wantOut: `{"type":"any"}`},
+		{name: "openai function object", in: `{"type":"function","function":{"name":"read"}}`, wantOut: `{"name":"read","type":"tool"}`},
+		{name: "anthropic passthrough auto", in: `{"type":"auto"}`, wantOut: `{"type":"auto"}`},
+		{name: "anthropic passthrough any", in: `{"type":"any"}`, wantOut: `{"type":"any"}`},
+		{name: "anthropic passthrough tool", in: `{"type":"tool","name":"read"}`, wantOut: `{"type":"tool","name":"read"}`},
+		{name: "bad string", in: `"weird"`, wantErr: true},
+		{name: "bad type", in: `{"type":"bogus"}`, wantErr: true},
+		{name: "function without name", in: `{"type":"function","function":{}}`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOut, gotDrop, err := translateToolChoice(json.RawMessage(tc.in))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if gotDrop != tc.wantDrop {
+				t.Errorf("dropTools = %v, want %v", gotDrop, tc.wantDrop)
+			}
+			if string(gotOut) != tc.wantOut {
+				t.Errorf("out = %q, want %q", string(gotOut), tc.wantOut)
+			}
+		})
+	}
+}
+
+func TestBuildAnthropicRequestWithStringToolChoice(t *testing.T) {
+	// "auto" string should produce {"type":"auto"} in the wire body, not crash.
+	body, err := buildAnthropicRequest(CompletionRequest{
+		Model:    "claude-opus-4-8",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Tools: []Tool{{Type: "function", Function: ToolDefinition{
+			Name:       "read",
+			Parameters: json.RawMessage(`{"type":"object"}`),
+		}}},
+		ToolChoice: json.RawMessage(`"auto"`),
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	tc, ok := got["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_choice not an object: %v", got["tool_choice"])
+	}
+	if tc["type"] != "auto" {
+		t.Errorf("tool_choice.type = %v, want auto", tc["type"])
+	}
+}
+
+func TestBuildAnthropicRequestNoneDropsTools(t *testing.T) {
+	body, err := buildAnthropicRequest(CompletionRequest{
+		Model:    "claude-opus-4-8",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Tools: []Tool{{Type: "function", Function: ToolDefinition{
+			Name:       "read",
+			Parameters: json.RawMessage(`{"type":"object"}`),
+		}}},
+		ToolChoice: json.RawMessage(`"none"`),
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got["tools"]; present {
+		t.Errorf("tools should be omitted when tool_choice=none, body=%v", got)
+	}
+	if _, present := got["tool_choice"]; present {
+		t.Errorf("tool_choice should be omitted when none, body=%v", got)
+	}
+}
+
 func TestBuildAnthropicRequestBasic(t *testing.T) {
 	maxTok := 1000
 	temp := 0.2

@@ -252,7 +252,15 @@ func buildAnthropicRequest(req CompletionRequest, stream bool) ([]byte, error) {
 		}
 	}
 
-	if len(req.Tools) > 0 {
+	// Translate OpenAI tool_choice into Anthropic's shape. If the caller
+	// sent "none" we drop tools entirely; for anything else we set
+	// tool_choice and pass tools through.
+	toolChoice, dropTools, err := translateToolChoice(req.ToolChoice)
+	if err != nil {
+		return nil, err
+	}
+
+	if !dropTools && len(req.Tools) > 0 {
 		out.Tools = make([]anthropicTool, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			if t.Type != "function" {
@@ -264,13 +272,74 @@ func buildAnthropicRequest(req CompletionRequest, stream bool) ([]byte, error) {
 				InputSchema: orEmptySchema(t.Function.Parameters),
 			})
 		}
-	}
-
-	if len(req.ToolChoice) > 0 {
-		out.ToolChoice = req.ToolChoice
+		if len(toolChoice) > 0 {
+			out.ToolChoice = toolChoice
+		}
 	}
 
 	return json.Marshal(out)
+}
+
+// translateToolChoice converts an OpenAI-shaped tool_choice into Anthropic's
+// form. OpenAI accepts:
+//   - "none"     → no tools should be called (we drop the tools array)
+//   - "auto"     → model decides (Anthropic default; we can omit or send {"type":"auto"})
+//   - "required" → must call some tool (Anthropic: {"type":"any"})
+//   - {"type":"function","function":{"name":"X"}} → force a specific tool
+//
+// Returns the Anthropic-shaped tool_choice (or nil to omit), a flag indicating
+// whether to drop the tools array entirely, and any translation error.
+func translateToolChoice(raw json.RawMessage) (json.RawMessage, bool, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil, false, nil
+	}
+
+	// String form: "auto" | "none" | "required"
+	var s string
+	if err := json.Unmarshal([]byte(trimmed), &s); err == nil {
+		switch s {
+		case "none":
+			return nil, true, nil
+		case "auto":
+			return json.RawMessage(`{"type":"auto"}`), false, nil
+		case "required":
+			return json.RawMessage(`{"type":"any"}`), false, nil
+		default:
+			return nil, false, fmt.Errorf("anthropic: unsupported tool_choice string %q", s)
+		}
+	}
+
+	// Object form: {"type":"function","function":{"name":"X"}}
+	var obj struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+		Name string `json:"name"` // already-Anthropic-shaped passthrough
+	}
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return nil, false, fmt.Errorf("anthropic: tool_choice not a string or object: %w", err)
+	}
+	switch obj.Type {
+	case "function":
+		if obj.Function.Name == "" {
+			return nil, false, fmt.Errorf("anthropic: tool_choice function.name is required")
+		}
+		out, _ := json.Marshal(map[string]string{"type": "tool", "name": obj.Function.Name})
+		return out, false, nil
+	case "auto", "any":
+		// Already in Anthropic shape; pass through.
+		return json.RawMessage(trimmed), false, nil
+	case "tool":
+		// Already Anthropic-shaped; pass through.
+		if obj.Name == "" {
+			return nil, false, fmt.Errorf("anthropic: tool_choice type=tool requires name")
+		}
+		return json.RawMessage(trimmed), false, nil
+	default:
+		return nil, false, fmt.Errorf("anthropic: unsupported tool_choice type %q", obj.Type)
+	}
 }
 
 func splitSystem(msgs []Message) (system []string, rest []Message) {
