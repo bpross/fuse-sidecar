@@ -1,0 +1,57 @@
+{
+  "listen": "127.0.0.1:7777",
+  "log_dir": "~/.local/share/fuse-sidecar",
+  "log_level": "info",
+  "reasoning_blocks_enabled": true,
+  "snapshot_retention": 1000,
+
+  "providers": {
+    "anthropic": {
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    "openai": {
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  },
+
+  "models": {
+    "fusion-plan": {
+      "primary": {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "temperature": 0.2
+      },
+      "panel": [
+        { "provider": "anthropic", "model": "claude-opus-4-7" },
+        { "provider": "anthropic", "model": "claude-sonnet-4-5" },
+        { "provider": "openai",    "model": "gpt-5" }
+      ],
+      "judge": {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "temperature": 0.0
+      },
+      "panel_timeout_ms": 25000,
+      "panel_min_success": 2
+    },
+
+    "fusion-code": {
+      "primary": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "temperature": 0.2
+      },
+      "panel": [
+        { "provider": "anthropic", "model": "claude-sonnet-4-5" },
+        { "provider": "openai",    "model": "gpt-5" }
+      ],
+      "judge": {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "temperature": 0.0
+      },
+      "panel_timeout_ms": 25000,
+      "panel_min_success": 2
+    }
+  }
+}
