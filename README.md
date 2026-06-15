@@ -149,32 +149,17 @@ soon). For now, configure clients manually.
 
 ### opencode
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "fuse": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Fuse (local)",
-      "options": { "baseURL": "http://127.0.0.1:7777/v1" },
-      "models": {
-        "fusion-plan": { "name": "Fusion · Plan" },
-        "fusion-code": { "name": "Fusion · Code" }
-      }
-    }
-  },
-  "agent": {
-    "fuse": {
-      "mode": "primary",
-      "model": "fuse/fusion-plan",
-      "description": "Plan with fused panel deliberation",
-      "permission": { "edit": "deny", "bash": "deny" }
-    }
-  }
-}
+A working configuration and step-by-step guide live in
+[`examples/opencode/`](./examples/opencode/). The short version:
+
+```sh
+cp examples/opencode/opencode.json ~/.config/opencode/opencode.json
 ```
 
-Tab into the `fuse` agent and your requests route through the sidecar.
+Then launch opencode, Tab to the `fuse` agent, and your requests route
+through the sidecar. The example covers both `fusion-plan` and
+`fusion-code` model IDs, reasoning-block progress rendering in the TUI,
+and per-snapshot debugging.
 
 ### Claude Code
 

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "provider": {
+    "fuse": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Fuse (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:7777/v1"
+      },
+      "models": {
+        "fusion-plan": {
+          "name": "Fusion · Plan"
+        },
+        "fusion-code": {
+          "name": "Fusion · Code"
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "fuse": {
+      "mode": "primary",
+      "model": "fuse/fusion-plan",
+      "description": "Plan with fused panel deliberation",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny"
+      }
+    }
+  }
+}
