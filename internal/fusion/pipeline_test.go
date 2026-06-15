@@ -2,6 +2,7 @@ package fusion
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -142,16 +143,22 @@ func TestPipelineFusionFullPath(t *testing.T) {
 	}
 }
 
-func TestPipelineFallbackOnPanelInsufficient(t *testing.T) {
+// TestPipelinePanelFailureUsesSpeculativeAsPanelist verifies that when all
+// real panel members fail, the speculative response is promoted to panel
+// member so fusion still runs end to end.
+func TestPipelinePanelFailureUsesSpeculativeAsPanelist(t *testing.T) {
 	prov := &fakeProvider{
 		name: "test",
 		completeByModel: map[string]*providers.CompletionResponse{
 			"primary": {Content: "speculative answer", FinishReason: "stop"},
 			"panel-a": nil, // returns error
+			"judge":   {Content: `{"consensus":["one perspective"],"contradictions":[],"partial":[]}`, FinishReason: "stop"},
 		},
 		errByModel: map[string]error{
 			"panel-a": errors.New("upstream 500"),
 		},
+		streamChunks: []providers.Delta{{Content: "Final fused answer."}},
+		streamFinish: "stop",
 	}
 	reg := providers.NewRegistry()
 	reg.Register(prov)
@@ -170,14 +177,162 @@ func TestPipelineFallbackOnPanelInsufficient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.Kind != DecisionFallback {
-		t.Errorf("kind = %s, want fallback", dec.Kind)
+	if dec.Kind != DecisionFusion {
+		t.Errorf("kind = %s, want fusion (speculative promoted to panel)", dec.Kind)
 	}
-	if dec.FallbackReason != "panel_insufficient" {
-		t.Errorf("reason = %q", dec.FallbackReason)
+	if dec.JudgeAnalysis == nil {
+		t.Errorf("expected judge analysis even with empty real panel")
 	}
-	if !strings.Contains(strings.Join(sink.contents, ""), "speculative answer") {
-		t.Errorf("expected buffered speculative content, got %v", sink.contents)
+	if !strings.Contains(strings.Join(sink.contents, ""), "Final fused answer.") {
+		t.Errorf("expected fused final-stream content, got %v", sink.contents)
+	}
+}
+
+// TestPipelinePanelStripsTools verifies that tools and tool_choice are
+// removed from the request passed to panel members. Panel members can't
+// execute tools (the agent loop on the client side owns execution), so
+// passing tools through causes them to emit tool_call responses we can't
+// satisfy. The conversation already contains the tool_call/tool_result
+// pairs from the primary's investigation; that's enough context.
+func TestPipelinePanelStripsTools(t *testing.T) {
+	prov := &fakeProvider{
+		name: "test",
+		completeByModel: map[string]*providers.CompletionResponse{
+			"primary": {Content: "speculative", FinishReason: "stop"},
+			"panel-a": {Content: "panel response", FinishReason: "stop"},
+			"judge":   {Content: `{"consensus":["a"],"contradictions":[],"partial":[]}`, FinishReason: "stop"},
+		},
+		streamChunks: []providers.Delta{{Content: "Final."}},
+		streamFinish: "stop",
+	}
+	reg := providers.NewRegistry()
+	reg.Register(prov)
+	p := &Pipeline{Registry: reg, Logger: discardLogger()}
+	sink := &captureSink{}
+
+	// Build a base request with tools attached, like opencode would send.
+	baseReq := providers.CompletionRequest{
+		Messages: []providers.Message{{Role: "user", Content: "do the thing"}},
+		Tools: []providers.Tool{{
+			Type: "function",
+			Function: providers.ToolDefinition{
+				Name:       "read",
+				Parameters: json.RawMessage(`{"type":"object"}`),
+			},
+		}},
+		ToolChoice: json.RawMessage(`"auto"`),
+	}
+
+	_, err := p.Run(context.Background(), config.Model{
+		Primary:         config.Endpoint{Provider: "test", Model: "primary"},
+		Panel:           []config.Endpoint{{Provider: "test", Model: "panel-a"}},
+		Judge:           config.Endpoint{Provider: "test", Model: "judge"},
+		PanelTimeoutMs:  5000,
+		PanelMinSuccess: 1,
+	}, baseReq, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Primary speculative call DOES get tools (it's the agent's real turn).
+	if got := prov.lastReq["primary"]; len(got.Tools) == 0 {
+		t.Errorf("primary call should have tools, got none")
+	}
+
+	// Panel call must NOT carry tools or tool_choice.
+	panelReq := prov.lastReq["panel-a"]
+	if len(panelReq.Tools) != 0 {
+		t.Errorf("panel call should have no tools, got %d", len(panelReq.Tools))
+	}
+	if len(panelReq.ToolChoice) != 0 {
+		t.Errorf("panel call should have no tool_choice, got %s", string(panelReq.ToolChoice))
+	}
+
+	// Judge call must also not carry tools.
+	judgeReq := prov.lastReq["judge"]
+	if len(judgeReq.Tools) != 0 {
+		t.Errorf("judge call should have no tools, got %d", len(judgeReq.Tools))
+	}
+}
+
+// TestPipelinePanelEmptyContentRetries verifies that a panel member returning
+// empty content on the first attempt is retried with a forced max_tokens floor.
+func TestPipelinePanelEmptyContentRetries(t *testing.T) {
+	prov := &fakeProvider{
+		name: "test",
+		completeByModel: map[string]*providers.CompletionResponse{
+			"primary": {Content: "speculative", FinishReason: "stop"},
+			"judge":   {Content: `{"consensus":["a"],"contradictions":[],"partial":[]}`, FinishReason: "stop"},
+		},
+		completeByModelSequence: map[string][]*providers.CompletionResponse{
+			// panel-a returns empty first, then content on retry.
+			"panel-a": {
+				{Content: "", FinishReason: "length"},
+				{Content: "now I have words", FinishReason: "stop"},
+			},
+		},
+		streamChunks: []providers.Delta{{Content: "Final."}},
+		streamFinish: "stop",
+	}
+	reg := providers.NewRegistry()
+	reg.Register(prov)
+	p := &Pipeline{Registry: reg, Logger: discardLogger()}
+	sink := &captureSink{}
+	dec, err := p.Run(context.Background(), config.Model{
+		Primary:         config.Endpoint{Provider: "test", Model: "primary"},
+		Panel:           []config.Endpoint{{Provider: "test", Model: "panel-a"}},
+		Judge:           config.Endpoint{Provider: "test", Model: "judge"},
+		PanelTimeoutMs:  5000,
+		PanelMinSuccess: 1,
+	}, providers.CompletionRequest{
+		Messages: []providers.Message{{Role: "user", Content: "go"}},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Kind != DecisionFusion {
+		t.Errorf("kind = %s, want fusion", dec.Kind)
+	}
+	if len(dec.Panel) != 1 || dec.Panel[0].Attempts != 2 {
+		t.Errorf("expected 1 panel result with attempts=2, got %+v", dec.Panel)
+	}
+	if !dec.Panel[0].OK {
+		t.Errorf("expected panel OK after retry, got %+v", dec.Panel[0])
+	}
+}
+
+// TestPipelinePanelAllFailAndSpeculativeEmpty verifies the true-fallback
+// branch: when both panel and speculative produced nothing usable, the
+// pipeline falls back cleanly to whatever speculative response existed.
+func TestPipelinePanelAllFailAndSpeculativeEmpty(t *testing.T) {
+	prov := &fakeProvider{
+		name: "test",
+		completeByModel: map[string]*providers.CompletionResponse{
+			"primary": {Content: "", FinishReason: "stop"}, // empty
+			"panel-a": nil,
+		},
+		errByModel: map[string]error{
+			"panel-a": errors.New("upstream 500"),
+		},
+	}
+	reg := providers.NewRegistry()
+	reg.Register(prov)
+	p := &Pipeline{Registry: reg, Logger: discardLogger()}
+	sink := &captureSink{}
+	dec, err := p.Run(context.Background(), config.Model{
+		Primary:         config.Endpoint{Provider: "test", Model: "primary"},
+		Panel:           []config.Endpoint{{Provider: "test", Model: "panel-a"}},
+		Judge:           config.Endpoint{Provider: "test", Model: "judge"},
+		PanelTimeoutMs:  5000,
+		PanelMinSuccess: 1,
+	}, providers.CompletionRequest{
+		Messages: []providers.Message{{Role: "user", Content: "go"}},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Kind != DecisionFallback || dec.FallbackReason != "panel_insufficient" {
+		t.Errorf("kind=%s reason=%s, want fallback/panel_insufficient", dec.Kind, dec.FallbackReason)
 	}
 }
 
@@ -230,6 +385,10 @@ func TestParseJudgeOutput(t *testing.T) {
 		{"clean", `{"consensus":["a"],"contradictions":[],"partial":[]}`, true},
 		{"fenced", "```json\n{\"consensus\":[\"a\"],\"contradictions\":[],\"partial\":[]}\n```", true},
 		{"trailing prose", "Here's the analysis: {\"consensus\":[\"a\"],\"contradictions\":[],\"partial\":[]} hope that helps", true},
+		{"flex string instead of array", `{"consensus":"only one point","contradictions":"none","partial":[]}`, true},
+		{"flex null", `{"consensus":null,"contradictions":[],"partial":[]}`, true},
+		{"missing fields", `{"consensus":["a"]}`, true},
+		{"unique with string values", `{"consensus":[],"contradictions":[],"partial":[],"unique":{"A":"single point"}}`, true},
 		{"garbage", `not json at all`, false},
 		{"empty", ``, false},
 	}
@@ -241,6 +400,39 @@ func TestParseJudgeOutput(t *testing.T) {
 		}
 		if tc.ok && got == nil {
 			t.Errorf("%s: nil analysis", tc.name)
+		}
+	}
+}
+
+func TestFlexStringsUnmarshal(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{`["a","b"]`, []string{"a", "b"}},
+		{`"only one"`, []string{"only one"}},
+		{`""`, nil},
+		{`"none"`, nil},
+		{`"None"`, nil},
+		{`"n/a"`, nil},
+		{`null`, nil},
+		{`[]`, []string{}},
+	}
+	for _, tc := range cases {
+		var fs flexStrings
+		if err := fs.UnmarshalJSON([]byte(tc.in)); err != nil {
+			t.Errorf("%s: err = %v", tc.in, err)
+			continue
+		}
+		got := []string(fs)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: len mismatch %d vs %d (%v)", tc.in, len(got), len(tc.want), got)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: position %d: %q vs %q", tc.in, i, got[i], tc.want[i])
+			}
 		}
 	}
 }
@@ -283,9 +475,22 @@ type fakeProvider struct {
 	name string
 	mu   sync.Mutex
 
-	completeResp     *providers.CompletionResponse
-	completeByModel  map[string]*providers.CompletionResponse
-	errByModel       map[string]error
+	completeResp    *providers.CompletionResponse
+	completeByModel map[string]*providers.CompletionResponse
+	errByModel      map[string]error
+
+	// completeByModelSequence lets a test return a different response on
+	// each call to the same model. Each call advances the per-model
+	// cursor; when exhausted, falls back to completeByModel/completeResp.
+	completeByModelSequence map[string][]*providers.CompletionResponse
+	sequenceCursor          map[string]int
+
+	// callCount tracks total Complete calls per model for retry tests.
+	callCount map[string]int
+
+	// lastReq captures the most recent CompletionRequest per model, useful
+	// for asserting on what was passed (e.g. tools stripped).
+	lastReq map[string]providers.CompletionRequest
 
 	streamChunks []providers.Delta
 	streamFinish string
@@ -296,8 +501,27 @@ func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Complete(_ context.Context, req providers.CompletionRequest) (*providers.CompletionResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.callCount == nil {
+		f.callCount = map[string]int{}
+	}
+	if f.lastReq == nil {
+		f.lastReq = map[string]providers.CompletionRequest{}
+	}
+	f.callCount[req.Model]++
+	f.lastReq[req.Model] = req
 	if err, ok := f.errByModel[req.Model]; ok && err != nil {
 		return nil, err
+	}
+	if seq, ok := f.completeByModelSequence[req.Model]; ok && len(seq) > 0 {
+		if f.sequenceCursor == nil {
+			f.sequenceCursor = map[string]int{}
+		}
+		idx := f.sequenceCursor[req.Model]
+		if idx < len(seq) {
+			f.sequenceCursor[req.Model] = idx + 1
+			return seq[idx], nil
+		}
+		// fall through if exhausted
 	}
 	if r, ok := f.completeByModel[req.Model]; ok {
 		return r, nil

@@ -136,16 +136,39 @@ func (o *OpenAI) newRequest(ctx context.Context, body []byte) (*http.Request, er
 // --- Request shapes ---
 
 type openAIRequest struct {
-	Model          string             `json:"model"`
-	Messages       []openAIMessage    `json:"messages"`
-	Tools          []Tool             `json:"tools,omitempty"`
-	ToolChoice     json.RawMessage    `json:"tool_choice,omitempty"`
-	Temperature    *float64           `json:"temperature,omitempty"`
-	MaxTokens      *int               `json:"max_tokens,omitempty"`
-	TopP           *float64           `json:"top_p,omitempty"`
-	Stop           []string           `json:"stop,omitempty"`
-	Stream         bool               `json:"stream,omitempty"`
-	ResponseFormat *ResponseFormat    `json:"response_format,omitempty"`
+	Model     string          `json:"model"`
+	Messages  []openAIMessage `json:"messages"`
+	Tools     []Tool          `json:"tools,omitempty"`
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	// MaxTokens is the legacy field used by gpt-4 and earlier.
+	MaxTokens *int `json:"max_tokens,omitempty"`
+	// MaxCompletionTokens is required by gpt-5 and o-series reasoning models.
+	// Exactly one of MaxTokens / MaxCompletionTokens should be set per request.
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	TopP                *float64        `json:"top_p,omitempty"`
+	Stop                []string        `json:"stop,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+}
+
+// modelUsesMaxCompletionTokens reports whether the given OpenAI model ID
+// requires max_completion_tokens instead of the legacy max_tokens. Heuristic
+// based on observed API behavior:
+//   - gpt-5*  (gpt-5, gpt-5-mini, gpt-5-codex, etc.)
+//   - o1*, o3*, o4* (reasoning models)
+// Anything else uses max_tokens. False positives here cost nothing because
+// OpenAI accepts max_completion_tokens on newer models without complaint;
+// false negatives produce the 400 we just hit.
+func modelUsesMaxCompletionTokens(model string) bool {
+	switch {
+	case strings.HasPrefix(model, "gpt-5"):
+		return true
+	case strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"), strings.HasPrefix(model, "o4"):
+		return true
+	default:
+		return false
+	}
 }
 
 type openAIMessage struct {
@@ -163,11 +186,17 @@ func buildOpenAIRequest(req CompletionRequest, stream bool) ([]byte, error) {
 		Tools:          req.Tools,
 		ToolChoice:     req.ToolChoice,
 		Temperature:    req.Temperature,
-		MaxTokens:      req.MaxTokens,
 		TopP:           req.TopP,
 		Stop:           req.Stop,
 		Stream:         stream,
 		ResponseFormat: req.ResponseFormat,
+	}
+	if req.MaxTokens != nil {
+		if modelUsesMaxCompletionTokens(req.Model) {
+			out.MaxCompletionTokens = req.MaxTokens
+		} else {
+			out.MaxTokens = req.MaxTokens
+		}
 	}
 	for _, m := range req.Messages {
 		out.Messages = append(out.Messages, openAIMessage{

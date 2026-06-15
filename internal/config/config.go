@@ -73,10 +73,17 @@ type Model struct {
 }
 
 // Endpoint names one model on one provider, with optional sampling overrides.
+//
+// MaxTokens controls how many output tokens this specific endpoint may use.
+// Reasoning models (gpt-5, o-series) burn budget on hidden reasoning before
+// emitting any visible output, so they often need a generous cap. Anthropic
+// requires max_tokens at the API level and the provider supplies a default;
+// this overrides per endpoint so panels can give slow thinkers more room.
 type Endpoint struct {
 	Provider    string   `json:"provider"`
 	Model       string   `json:"model"`
 	Temperature *float64 `json:"temperature,omitempty"`
+	MaxTokens   *int     `json:"max_tokens,omitempty"`
 }
 
 // Load reads, parses, and validates a config file. Tilde in LogDir is expanded.

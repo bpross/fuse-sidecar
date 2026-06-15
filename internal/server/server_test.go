@@ -176,17 +176,22 @@ func TestFusionEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFusionFallbackOnPanelFailure verifies that when panel fails the
-// buffered speculative response is emitted as the answer.
-func TestFusionFallbackOnPanelFailure(t *testing.T) {
+// TestFusionPanelFailureStillFuses verifies that when every real panel
+// member fails, fusion still runs by promoting the speculative response
+// to a virtual panel member. The judge runs and a fused answer is
+// returned through the streaming primary call.
+func TestFusionPanelFailureStillFuses(t *testing.T) {
 	mp := &mockProvider{
 		completeByModel: map[string]*providers.CompletionResponse{
 			"mock-primary": {Content: "speculative answer", FinishReason: "stop"},
+			"mock-judge":   {Content: `{"consensus":["only one perspective"],"contradictions":[],"partial":[]}`, FinishReason: "stop"},
 		},
 		errByModel: map[string]error{
 			"mock-panel-1": errors.New("panel boom"),
 			"mock-panel-2": errors.New("panel boom"),
 		},
+		streamChunks: []providers.Delta{{Content: "Final streamed answer."}},
+		streamFinish: "stop",
 	}
 
 	s := newTestServerMulti(t, mp)
@@ -203,15 +208,15 @@ func TestFusionFallbackOnPanelFailure(t *testing.T) {
 		t.Fatalf("status = %d", rr.Code)
 	}
 	out := rr.Body.String()
-	if !strings.Contains(out, "speculative answer") {
-		t.Errorf("expected speculative content in fallback: %s", out)
+	if !strings.Contains(out, "Final streamed answer.") {
+		t.Errorf("expected fused final content: %s", out)
 	}
 
 	statusReq := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
 	statusRR := httptest.NewRecorder()
 	s.Handler().ServeHTTP(statusRR, statusReq)
-	if !strings.Contains(statusRR.Body.String(), `"fallback_reason":"panel_insufficient"`) {
-		t.Errorf("status missing fallback reason: %s", statusRR.Body.String())
+	if !strings.Contains(statusRR.Body.String(), `"decision":"fusion"`) {
+		t.Errorf("status should record fusion (speculative promoted), got: %s", statusRR.Body.String())
 	}
 }
 

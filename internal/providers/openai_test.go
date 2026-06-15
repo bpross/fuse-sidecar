@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -165,6 +166,59 @@ func TestOpenAIStreamToolCallDeltas(t *testing.T) {
 	}
 	if args != `{"path":"x"}` {
 		t.Errorf("accumulated args = %q", args)
+	}
+}
+
+func TestOpenAIMaxCompletionTokensRouting(t *testing.T) {
+	cases := []struct {
+		model    string
+		wantNew  bool
+	}{
+		{"gpt-4", false},
+		{"gpt-4o", false},
+		{"gpt-4o-mini", false},
+		{"gpt-4.1", false},
+		{"gpt-5", true},
+		{"gpt-5-mini", true},
+		{"gpt-5-codex", true},
+		{"gpt-5-pro", true},
+		{"o1", true},
+		{"o1-mini", true},
+		{"o3", true},
+		{"o3-mini", true},
+		{"o4-mini", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			max := 1234
+			body, err := buildOpenAIRequest(CompletionRequest{
+				Model:     tc.model,
+				Messages:  []Message{{Role: "user", Content: "hi"}},
+				MaxTokens: &max,
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantNew {
+				if _, ok := got["max_completion_tokens"]; !ok {
+					t.Errorf("expected max_completion_tokens for %s, body=%v", tc.model, got)
+				}
+				if _, ok := got["max_tokens"]; ok {
+					t.Errorf("expected NO max_tokens for %s, body=%v", tc.model, got)
+				}
+			} else {
+				if _, ok := got["max_tokens"]; !ok {
+					t.Errorf("expected max_tokens for %s, body=%v", tc.model, got)
+				}
+				if _, ok := got["max_completion_tokens"]; ok {
+					t.Errorf("expected NO max_completion_tokens for %s, body=%v", tc.model, got)
+				}
+			}
+		})
 	}
 }
 

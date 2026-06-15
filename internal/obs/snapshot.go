@@ -13,16 +13,17 @@ import (
 // handled. Written to disk per request when fusion fires (and for some
 // fallback paths) so postmortems are possible without re-running.
 type Snapshot struct {
-	RequestID       string         `json:"request_id"`
-	Timestamp       time.Time      `json:"timestamp"`
-	ModelID         string         `json:"model_id"`
-	Decision        string         `json:"decision"` // "passthrough", "fusion", "fallback"
-	FallbackReason  string         `json:"fallback_reason,omitempty"`
-	TotalLatencyMs  int64          `json:"total_latency_ms"`
-	Panel           []PanelResult  `json:"panel,omitempty"`
-	JudgeLatencyMs  int64          `json:"judge_latency_ms,omitempty"`
-	JudgeAnalysis   map[string]any `json:"judge_analysis,omitempty"`
-	FinalAnswerHash string         `json:"final_answer_hash,omitempty"`
+	RequestID        string         `json:"request_id"`
+	Timestamp        time.Time      `json:"timestamp"`
+	ModelID          string         `json:"model_id"`
+	Decision         string         `json:"decision"` // "passthrough", "fusion", "fallback"
+	FallbackReason   string         `json:"fallback_reason,omitempty"`
+	TotalLatencyMs   int64          `json:"total_latency_ms"`
+	Panel            []PanelResult  `json:"panel,omitempty"`
+	JudgeLatencyMs   int64          `json:"judge_latency_ms,omitempty"`
+	JudgeAnalysis    map[string]any `json:"judge_analysis,omitempty"`
+	FinalAnswerBytes int            `json:"final_answer_bytes,omitempty"`
+	FinalAnswerHead  string         `json:"final_answer_head,omitempty"`
 }
 
 // PanelResult is one panel member's response metadata. The response body
@@ -35,6 +36,7 @@ type PanelResult struct {
 	LatencyMs int64  `json:"latency_ms"`
 	OK        bool   `json:"ok"`
 	Error     string `json:"error,omitempty"`
+	Attempts  int    `json:"attempts,omitempty"`
 }
 
 // SnapshotWriter persists snapshots to a directory, pruning to a retention

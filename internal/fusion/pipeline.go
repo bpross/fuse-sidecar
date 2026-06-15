@@ -32,6 +32,14 @@ type Decision struct {
 	JudgeLatency   time.Duration
 	JudgeAnalysis  map[string]any
 	TotalLatency   time.Duration
+	// FinalAnswerBytes is the total bytes of content emitted to the sink
+	// during the final answer phase (the buffered passthrough or the
+	// streaming final primary call). Useful for "did the model say
+	// anything?" debugging.
+	FinalAnswerBytes int
+	// FinalAnswerHead is a UTF-8-safe prefix (≤200 bytes) of what was
+	// emitted, for postmortem inspection without storing full bodies.
+	FinalAnswerHead string
 }
 
 // DecisionKind classifies how a request was served.
@@ -50,6 +58,7 @@ type PanelResult struct {
 	LatencyMs int64
 	OK        bool
 	Error     string
+	Attempts  int
 }
 
 // Pipeline owns the fusion decision logic. It is provider- and transport-
@@ -70,9 +79,18 @@ func (p *Pipeline) Run(
 	model config.Model,
 	base providers.CompletionRequest,
 	sink Sink,
-) (Decision, error) {
+) (dec Decision, err error) {
 	start := time.Now()
-	dec := Decision{Kind: DecisionPassthrough}
+	dec = Decision{Kind: DecisionPassthrough}
+
+	// Wrap the sink so the pipeline can record how much content reached the
+	// client regardless of which branch (passthrough/fusion/fallback) ran.
+	counted := &countingSink{inner: sink}
+	sink = counted
+	defer func() {
+		dec.FinalAnswerBytes = counted.bytes
+		dec.FinalAnswerHead = counted.head()
+	}()
 
 	primaryEP := model.Primary
 	primary, ok := p.Registry.Get(primaryEP.Provider)
@@ -115,18 +133,38 @@ func (p *Pipeline) Run(
 	panel := summarizePanel(rawResults)
 
 	if len(panel.Successes) < model.PanelMinSuccess {
-		// Not enough panel responses — fall back to buffered speculative.
-		if p.EmitProgress {
-			_ = sink.Progress("fuse: insufficient panel, using speculative answer")
-		}
-		if err := emitBuffered(sink, specResp); err != nil {
+		// Not enough panel responses to satisfy panel_min_success. Rather
+		// than fall back to a raw speculative answer (which skips the
+		// judge layer entirely), include the speculative response itself
+		// as a synthesized panel member and let the judge analyze it.
+		// This guarantees fusion always runs as long as the primary
+		// produced something, even when every panel model failed.
+		if specResp != nil && specResp.Content != "" {
+			panel.Successes = append(panel.Successes, PanelMemberResult{
+				Endpoint: config.Endpoint{
+					Provider: primaryEP.Provider,
+					Model:    primaryEP.Model + " (speculative)",
+				},
+				Response: specResp,
+				Attempts: 1,
+			})
+			if p.EmitProgress {
+				_ = sink.Progress("fuse: panel sparse, using speculative as fallback panelist")
+			}
+		} else {
+			// Speculative also failed to produce content. Nothing to fuse.
+			if p.EmitProgress {
+				_ = sink.Progress("fuse: no panel responses, using speculative answer")
+			}
+			if err := emitBuffered(sink, specResp); err != nil {
+				dec.TotalLatency = time.Since(start)
+				return dec, err
+			}
+			dec.Kind = DecisionFallback
+			dec.FallbackReason = "panel_insufficient"
 			dec.TotalLatency = time.Since(start)
-			return dec, err
+			return dec, nil
 		}
-		dec.Kind = DecisionFallback
-		dec.FallbackReason = "panel_insufficient"
-		dec.TotalLatency = time.Since(start)
-		return dec, nil
 	}
 
 	// ---- 4. Judge ----
@@ -195,13 +233,17 @@ func (p *Pipeline) Run(
 }
 
 // withEndpoint copies base and applies the endpoint's model and optional
-// temperature override. base is not mutated.
+// sampling overrides. base is not mutated.
 func withEndpoint(base providers.CompletionRequest, ep config.Endpoint) providers.CompletionRequest {
 	out := base
 	out.Model = ep.Model
 	if ep.Temperature != nil {
 		t := *ep.Temperature
 		out.Temperature = &t
+	}
+	if ep.MaxTokens != nil {
+		n := *ep.MaxTokens
+		out.MaxTokens = &n
 	}
 	return out
 }
@@ -253,13 +295,73 @@ func panelResultsForSnapshot(results []PanelMemberResult) []PanelResult {
 			Model:     r.Endpoint.Model,
 			LatencyMs: r.Latency.Milliseconds(),
 			OK:        r.OK(),
+			Attempts:  r.Attempts,
 		}
-		if r.Err != nil {
+		switch {
+		case r.Err != nil:
 			pr.Error = r.Err.Error()
+		case r.Response == nil:
+			pr.Error = "no response returned"
+		case r.Response.Content == "":
+			pr.Error = fmt.Sprintf("response had empty content (finish=%q, prompt_tokens=%d, completion_tokens=%d)",
+				r.Response.FinishReason, r.Response.Usage.PromptTokens, r.Response.Usage.CompletionTokens)
 		}
 		out = append(out, pr)
 	}
 	return out
+}
+
+// countingSink wraps a Sink and tallies bytes of content emitted, also
+// retaining a UTF-8-safe prefix for postmortem inspection. Used by Run to
+// record what the client actually received without changing every branch.
+type countingSink struct {
+	inner Sink
+	bytes int
+	buf   []byte // up to 512 bytes
+}
+
+const countingSinkHeadCap = 512
+
+func (c *countingSink) Progress(text string) error {
+	// Progress is reasoning_content, not visible "answer" content. Skip.
+	return c.inner.Progress(text)
+}
+
+func (c *countingSink) Content(text string) error {
+	c.bytes += len(text)
+	if len(c.buf) < countingSinkHeadCap {
+		need := countingSinkHeadCap - len(c.buf)
+		if need > len(text) {
+			need = len(text)
+		}
+		c.buf = append(c.buf, text[:need]...)
+	}
+	return c.inner.Content(text)
+}
+
+func (c *countingSink) ToolCallDelta(d providers.ToolCallDelta) error {
+	return c.inner.ToolCallDelta(d)
+}
+
+func (c *countingSink) Done(reason string) error {
+	return c.inner.Done(reason)
+}
+
+// head returns up to 200 valid UTF-8 bytes from the buffer.
+func (c *countingSink) head() string {
+	if len(c.buf) == 0 {
+		return ""
+	}
+	const maxHead = 200
+	end := len(c.buf)
+	if end > maxHead {
+		end = maxHead
+	}
+	// Walk back to a UTF-8 boundary if we sliced mid-rune.
+	for end > 0 && (c.buf[end-1]&0xC0) == 0x80 {
+		end--
+	}
+	return string(c.buf[:end])
 }
 
 // finalStreamSink adapts a Pipeline.Sink to a providers.StreamSink for the

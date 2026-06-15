@@ -13,12 +13,47 @@ import (
 // JudgeAnalysis is the structured output the judge produces. Mirrors the
 // fields described in OpenRouter's fusion docs: it is comparison, not
 // merging. The primary writes the final answer using this as context.
+//
+// flexStrings tolerates judges that emit a single string instead of an
+// array when there's one item (or no items). flexStringMap does the same
+// for the unique map's values.
 type JudgeAnalysis struct {
-	Consensus      []string            `json:"consensus"`
-	Contradictions []string            `json:"contradictions"`
-	Partial        []string            `json:"partial"`
-	Unique         map[string][]string `json:"unique,omitempty"`
-	BlindSpots     []string            `json:"blind_spots,omitempty"`
+	Consensus      flexStrings            `json:"consensus,omitempty"`
+	Contradictions flexStrings            `json:"contradictions,omitempty"`
+	Partial        flexStrings            `json:"partial,omitempty"`
+	Unique         map[string]flexStrings `json:"unique,omitempty"`
+	BlindSpots     flexStrings            `json:"blind_spots,omitempty"`
+}
+
+// flexStrings is a []string that also unmarshals from a bare string or null.
+// LLMs frequently collapse single-element arrays to strings or send "none"
+// when they mean an empty list; this absorbs that.
+type flexStrings []string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (f *flexStrings) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*f = nil
+		return nil
+	}
+	// Try array first.
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*f = arr
+		return nil
+	}
+	// Try single string.
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if s == "" || strings.EqualFold(s, "none") || strings.EqualFold(s, "n/a") {
+			*f = nil
+			return nil
+		}
+		*f = []string{s}
+		return nil
+	}
+	return fmt.Errorf("flexStrings: expected string, array, or null, got %s", trimmed)
 }
 
 const judgeSystemPrompt = `You are a judge comparing multiple model responses to the same prompt.
@@ -66,6 +101,9 @@ func runJudge(
 	if err != nil {
 		return nil, fmt.Errorf("judge call: %w", err)
 	}
+	if resp == nil {
+		return nil, fmt.Errorf("judge call: no response returned")
+	}
 
 	analysis, err := parseJudgeOutput(resp.Content)
 	if err == nil {
@@ -77,6 +115,9 @@ func runJudge(
 	resp, err2 := prov.Complete(ctx, req)
 	if err2 != nil {
 		return nil, fmt.Errorf("judge retry: %w", err2)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("judge retry: no response returned")
 	}
 	analysis, err = parseJudgeOutput(resp.Content)
 	if err != nil {

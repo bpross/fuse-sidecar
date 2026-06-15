@@ -24,15 +24,15 @@
       "panel": [
         { "provider": "anthropic", "model": "claude-opus-4-7" },
         { "provider": "anthropic", "model": "claude-sonnet-4-5" },
-        { "provider": "openai",    "model": "gpt-5" }
+        { "provider": "openai",    "model": "gpt-5", "max_tokens": 16384 }
       ],
       "judge": {
         "provider": "anthropic",
         "model": "claude-opus-4-7",
         "temperature": 0.0
       },
-      "panel_timeout_ms": 25000,
-      "panel_min_success": 2
+      "panel_timeout_ms": 90000,
+      "panel_min_success": 1
     },
 
     "fusion-code": {
@@ -43,15 +43,15 @@
       },
       "panel": [
         { "provider": "anthropic", "model": "claude-sonnet-4-5" },
-        { "provider": "openai",    "model": "gpt-5" }
+        { "provider": "openai",    "model": "gpt-5", "max_tokens": 16384 }
       ],
       "judge": {
         "provider": "anthropic",
         "model": "claude-opus-4-7",
         "temperature": 0.0
       },
-      "panel_timeout_ms": 25000,
-      "panel_min_success": 2
+      "panel_timeout_ms": 90000,
+      "panel_min_success": 1
     }
   }
 }

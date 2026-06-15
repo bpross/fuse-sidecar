@@ -26,12 +26,15 @@ func buildHandoffMessages(original []providers.Message, analysis *JudgeAnalysis)
 
 	out = append(out, providers.Message{
 		Role: "assistant",
-		Content: "I consulted a panel of models and received this structured analysis:\n\n" +
+		Content: "Before writing my final answer I consulted a panel of models. " +
+			"Here is the structured judge analysis of their responses:\n\n" +
 			string(compact),
 	})
 	out = append(out, providers.Message{
-		Role:    "user",
-		Content: "Using the panel analysis above as additional context, now write the final answer to my original request. Do not mention the panel or the analysis in your answer.",
+		Role: "user",
+		Content: "Using the panel analysis above as additional context, now write your complete final answer to my original request. " +
+			"Write the full answer in your own voice — do not just summarize or reference the analysis, and do not mention the panel. " +
+			"If my original request was for a plan, document, or detailed explanation, produce that in full now.",
 	})
 	return out
 }

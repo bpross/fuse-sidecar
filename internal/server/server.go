@@ -208,15 +208,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snap := obs.Snapshot{
-		RequestID:      requestID,
-		Timestamp:      start,
-		ModelID:        req.Model,
-		Decision:       string(dec.Kind),
-		FallbackReason: dec.FallbackReason,
-		TotalLatencyMs: latency.Milliseconds(),
-		JudgeLatencyMs: dec.JudgeLatency.Milliseconds(),
-		JudgeAnalysis:  dec.JudgeAnalysis,
-		Panel:          panelResultsToObs(dec.Panel),
+		RequestID:        requestID,
+		Timestamp:        start,
+		ModelID:          req.Model,
+		Decision:         string(dec.Kind),
+		FallbackReason:   dec.FallbackReason,
+		TotalLatencyMs:   latency.Milliseconds(),
+		JudgeLatencyMs:   dec.JudgeLatency.Milliseconds(),
+		JudgeAnalysis:    dec.JudgeAnalysis,
+		Panel:            panelResultsToObs(dec.Panel),
+		FinalAnswerBytes: dec.FinalAnswerBytes,
+		FinalAnswerHead:  dec.FinalAnswerHead,
 	}
 	s.recordSnapshot(snap)
 
@@ -254,6 +256,7 @@ func panelResultsToObs(in []fusion.PanelResult) []obs.PanelResult {
 			LatencyMs: r.LatencyMs,
 			OK:        r.OK,
 			Error:     r.Error,
+			Attempts:  r.Attempts,
 		})
 	}
 	return out
