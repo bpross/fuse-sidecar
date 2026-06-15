@@ -16,7 +16,7 @@ type Snapshot struct {
 	RequestID        string         `json:"request_id"`
 	Timestamp        time.Time      `json:"timestamp"`
 	ModelID          string         `json:"model_id"`
-	Decision         string         `json:"decision"` // "passthrough", "fusion", "fallback"
+	Decision         string         `json:"decision"` // "tool_call", "fusion", "degraded", "failed"
 	FallbackReason   string         `json:"fallback_reason,omitempty"`
 	TotalLatencyMs   int64          `json:"total_latency_ms"`
 	Panel            []PanelResult  `json:"panel,omitempty"`
@@ -24,6 +24,20 @@ type Snapshot struct {
 	JudgeAnalysis    map[string]any `json:"judge_analysis,omitempty"`
 	FinalAnswerBytes int            `json:"final_answer_bytes,omitempty"`
 	FinalAnswerHead  string         `json:"final_answer_head,omitempty"`
+	// Usage is the token spend rolled up across every upstream call this
+	// turn made (speculative + panel + judge + final). It is the headline
+	// cost number for the turn.
+	Usage *Usage `json:"usage,omitempty"`
+}
+
+// Usage is the per-turn token rollup recorded in a snapshot. CacheRead and
+// CacheCreation split the input spend across prompt-cache reads vs writes;
+// a high CacheRead relative to Input means caching is doing its job.
+type Usage struct {
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 // PanelResult is one panel member's response metadata. The response body
@@ -31,12 +45,16 @@ type Snapshot struct {
 // bounded; callers that need the bodies can attach them via Snapshot.Panel
 // if the model config opts in (future work).
 type PanelResult struct {
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	LatencyMs int64  `json:"latency_ms"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	Attempts  int    `json:"attempts,omitempty"`
+	Provider            string `json:"provider"`
+	Model               string `json:"model"`
+	LatencyMs           int64  `json:"latency_ms"`
+	OK                  bool   `json:"ok"`
+	Error               string `json:"error,omitempty"`
+	Attempts            int    `json:"attempts,omitempty"`
+	InputTokens         int    `json:"input_tokens,omitempty"`
+	OutputTokens        int    `json:"output_tokens,omitempty"`
+	CacheReadTokens     int    `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int    `json:"cache_creation_tokens,omitempty"`
 }
 
 // SnapshotWriter persists snapshots to a directory, pruning to a retention

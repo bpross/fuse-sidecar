@@ -1,8 +1,6 @@
 package providers
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,11 +16,7 @@ import (
 // for OpenRouter, LM Studio, llama.cpp, or any other OpenAI-compatible
 // endpoint that differs only in base URL and headers.
 type OpenAI struct {
-	name    string
-	apiKey  string
-	baseURL string
-	headers map[string]string
-	client  *http.Client
+	t transport
 }
 
 // OpenAIConfig contains construction parameters.
@@ -49,11 +43,14 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 		c = &http.Client{}
 	}
 	return &OpenAI{
-		name:    name,
-		apiKey:  cfg.APIKey,
-		baseURL: strings.TrimRight(base, "/"),
-		headers: cfg.Headers,
-		client:  c,
+		t: transport{
+			client:     c,
+			baseURL:    strings.TrimRight(base, "/"),
+			headers:    cfg.Headers,
+			authHeader: "Authorization",
+			authValue:  "Bearer " + cfg.APIKey,
+			name:       name,
+		},
 	}
 }
 
@@ -68,7 +65,7 @@ func NewOpenAICompatible(name string, cfg OpenAIConfig) *OpenAI {
 }
 
 // Name returns the provider identifier (e.g. "openai" or "openrouter").
-func (o *OpenAI) Name() string { return o.name }
+func (o *OpenAI) Name() string { return o.t.name }
 
 // Complete runs a non-streaming chat completion.
 func (o *OpenAI) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
@@ -76,61 +73,32 @@ func (o *OpenAI) Complete(ctx context.Context, req CompletionRequest) (*Completi
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := o.newRequest(ctx, body)
+	resp, err := o.t.post(ctx, "/v1/chat/completions", body, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := o.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("%s http: %w", o.name, err)
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, readError(resp, o.name)
-	}
 
 	var raw openAIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("%s decode: %w", o.name, err)
+		return nil, fmt.Errorf("%s decode: %w", o.t.name, err)
 	}
 	return raw.toCompletionResponse(), nil
 }
 
-// Stream runs a streaming chat completion, emitting deltas to sink.
-func (o *OpenAI) Stream(ctx context.Context, req CompletionRequest, sink StreamSink) error {
+// Stream runs a streaming chat completion, emitting deltas to sink and
+// returning the usage from the final include_usage chunk.
+func (o *OpenAI) Stream(ctx context.Context, req CompletionRequest, sink Sink) (Usage, error) {
 	body, err := buildOpenAIRequest(req, true)
 	if err != nil {
-		return err
+		return Usage{}, err
 	}
-	httpReq, err := o.newRequest(ctx, body)
+	resp, err := o.t.post(ctx, "/v1/chat/completions", body, http.Header{"Accept": []string{"text/event-stream"}})
 	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-
-	resp, err := o.client.Do(httpReq)
-	if err != nil {
-		return fmt.Errorf("%s http: %w", o.name, err)
+		return Usage{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return readError(resp, o.name)
-	}
 	return parseOpenAIStream(resp.Body, sink)
-}
-
-func (o *OpenAI) newRequest(ctx context.Context, body []byte) (*http.Request, error) {
-	url := o.baseURL + "/v1/chat/completions"
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+o.apiKey)
-	for k, v := range o.headers {
-		r.Header.Set(k, v)
-	}
-	return r, nil
 }
 
 // --- Request shapes ---
@@ -145,11 +113,17 @@ type openAIRequest struct {
 	MaxTokens *int `json:"max_tokens,omitempty"`
 	// MaxCompletionTokens is required by gpt-5 and o-series reasoning models.
 	// Exactly one of MaxTokens / MaxCompletionTokens should be set per request.
-	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
-	TopP                *float64        `json:"top_p,omitempty"`
-	Stop                []string        `json:"stop,omitempty"`
-	Stream              bool            `json:"stream,omitempty"`
-	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+	MaxCompletionTokens *int                `json:"max_completion_tokens,omitempty"`
+	TopP                *float64            `json:"top_p,omitempty"`
+	Stop                []string            `json:"stop,omitempty"`
+	Stream              bool                `json:"stream,omitempty"`
+	StreamOptions       *openAIStreamOption `json:"stream_options,omitempty"`
+	ResponseFormat      *ResponseFormat     `json:"response_format,omitempty"`
+}
+
+// openAIStreamOption requests a final usage chunk on streaming responses.
+type openAIStreamOption struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // modelUsesMaxCompletionTokens reports whether the given OpenAI model ID
@@ -198,6 +172,11 @@ func buildOpenAIRequest(req CompletionRequest, stream bool) ([]byte, error) {
 			out.MaxTokens = req.MaxTokens
 		}
 	}
+	if stream {
+		// Ask for a trailing usage chunk so streaming calls can report
+		// token + cache counts the same way non-streaming calls do.
+		out.StreamOptions = &openAIStreamOption{IncludeUsage: true}
+	}
 	for _, m := range req.Messages {
 		out.Messages = append(out.Messages, openAIMessage{
 			Role:       m.Role,
@@ -226,18 +205,38 @@ type openAIChoice struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// toUsage converts OpenAI's usage block. OpenAI does automatic prefix
+// caching with no opt-in; cached_tokens reports how many prompt tokens
+// were served from cache. prompt_tokens already includes the cached
+// tokens, so we subtract to keep PromptTokens meaning "uncached input"
+// consistent with the Anthropic mapping. OpenAI does not bill a cache
+// write premium, so CacheCreationTokens stays zero.
+func (u openAIUsage) toUsage() Usage {
+	cached := u.PromptTokensDetails.CachedTokens
+	uncached := u.PromptTokens - cached
+	if uncached < 0 {
+		uncached = 0
+	}
+	return Usage{
+		PromptTokens:        uncached,
+		CompletionTokens:    u.CompletionTokens,
+		TotalTokens:         u.TotalTokens,
+		CacheReadTokens:     cached,
+		CacheCreationTokens: 0,
+	}
 }
 
 func (r *openAIResponse) toCompletionResponse() *CompletionResponse {
 	out := &CompletionResponse{
-		Usage: Usage{
-			PromptTokens:     r.Usage.PromptTokens,
-			CompletionTokens: r.Usage.CompletionTokens,
-			TotalTokens:      r.Usage.TotalTokens,
-		},
+		Usage: r.Usage.toUsage(),
 	}
 	if len(r.Choices) > 0 {
 		c := r.Choices[0]
@@ -254,6 +253,8 @@ type openAIStreamChunk struct {
 	ID      string               `json:"id"`
 	Object  string               `json:"object"`
 	Choices []openAIStreamChoice `json:"choices"`
+	// Usage is present only on the final chunk when include_usage is set.
+	Usage *openAIUsage `json:"usage"`
 }
 
 type openAIStreamChoice struct {
@@ -281,29 +282,21 @@ type openAIStreamFunctionCall struct {
 	Arguments string `json:"arguments,omitempty"`
 }
 
-func parseOpenAIStream(body io.Reader, sink StreamSink) error {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	var finish string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(line[len("data:"):])
-		if data == "" {
-			continue
-		}
-		if data == "[DONE]" {
-			return sink.Done(finish)
+func parseOpenAIStream(body io.Reader, sink Sink) (Usage, error) {
+	var (
+		finish string
+		usage  Usage
+	)
+	err := scanSSE(body, func(ev sseEvent) error {
+		if ev.Data == "[DONE]" {
+			return errStreamDone
 		}
 		var chunk openAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		if err := json.Unmarshal([]byte(ev.Data), &chunk); err != nil {
 			return fmt.Errorf("openai stream chunk: %w", err)
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage.toUsage()
 		}
 		for _, c := range chunk.Choices {
 			if c.FinishReason != nil && *c.FinishReason != "" {
@@ -330,14 +323,12 @@ func parseOpenAIStream(body io.Reader, sink StreamSink) error {
 				}
 			}
 		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStreamDone) {
+		return Usage{}, err
 	}
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
-		return fmt.Errorf("openai stream scan: %w", err)
-	}
-	return sink.Done(finish)
+	return usage, sink.Done(finish)
 }
 
 var _ Provider = (*OpenAI)(nil)

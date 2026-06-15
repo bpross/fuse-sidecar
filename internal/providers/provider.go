@@ -18,19 +18,26 @@ import (
 // and the judge call.
 //
 // Stream runs a single streaming completion, emitting deltas to sink as
-// they arrive. It is used for the final primary call.
+// they arrive and returning the token usage reported at end of stream.
+// It is used for the final primary call. Usage is zero-valued if the
+// provider did not report it.
 type Provider interface {
 	Name() string
 	Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error)
-	Stream(ctx context.Context, req CompletionRequest, sink StreamSink) error
+	Stream(ctx context.Context, req CompletionRequest, sink Sink) (Usage, error)
 }
 
-// StreamSink receives streaming deltas. Implementations must be safe to
-// call from the goroutine that owns Provider.Stream (we do not call sink
-// from multiple goroutines per request).
-type StreamSink interface {
-	// Delta is called for each incremental chunk. Either Content or
-	// ToolCallDelta or ReasoningContent is non-empty; never more than one.
+// Sink receives streaming events from providers and from the fusion
+// pipeline. It is the single emission interface for the whole system:
+// providers stream deltas into it; the pipeline writes progress events
+// into it as Delta{ReasoningContent: ...}; the server adapts it to SSE.
+//
+// Implementations must be safe to call from the goroutine that owns the
+// caller (we do not call Sink methods from multiple goroutines per
+// request).
+type Sink interface {
+	// Delta is called for each incremental chunk. Exactly one of Content,
+	// ReasoningContent, or ToolCallDelta is non-empty per Delta.
 	Delta(d Delta) error
 	// Done is called exactly once at end of stream with the finish reason.
 	Done(finishReason string) error
@@ -48,6 +55,14 @@ type CompletionRequest struct {
 	Stop        []string
 	// ResponseFormat is used by the judge call to coerce structured output.
 	ResponseFormat *ResponseFormat
+	// CachePrefix requests that the provider mark the conversation prefix
+	// (system + tools + messages, up to and including the last message) as
+	// cacheable. Providers that support prefix caching (Anthropic) emit a
+	// cache_control breakpoint; providers that cache automatically (OpenAI)
+	// or not at all ignore the flag. The synthetic handoff turns appended
+	// after fusion are intentionally added *after* this prefix so they do
+	// not invalidate the cache shared with the speculative call.
+	CachePrefix bool
 }
 
 // CompletionResponse is the provider-agnostic response shape, modeled on
@@ -62,10 +77,29 @@ type CompletionResponse struct {
 }
 
 // Usage is token counts when available; zero values are fine.
+//
+// CacheReadTokens and CacheCreationTokens break out the prompt token spend
+// across prompt caching: tokens served from a provider's prefix cache vs
+// tokens written into it. Both providers surface these (Anthropic via
+// cache_read_input_tokens / cache_creation_input_tokens, OpenAI via
+// prompt_tokens_details.cached_tokens) and they are zero when caching did
+// not apply.
 type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
+	CacheReadTokens     int
+	CacheCreationTokens int
+}
+
+// Add accumulates another Usage into this one. Used to roll per-call usage
+// up into a per-turn total.
+func (u *Usage) Add(other Usage) {
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.TotalTokens += other.TotalTokens
+	u.CacheReadTokens += other.CacheReadTokens
+	u.CacheCreationTokens += other.CacheCreationTokens
 }
 
 // Delta is one streaming chunk.
@@ -76,12 +110,20 @@ type Delta struct {
 }
 
 // Message is a single conversation message in OpenAI shape.
+//
+// CacheBreakpoint marks this message as the end of the cacheable prefix.
+// It is an internal control flag, not part of the wire format (the json
+// tag is "-"). When set, a cache-aware provider places its cache_control
+// marker on this message instead of the last message. This lets the
+// fusion pipeline cache the original conversation prefix while leaving the
+// appended handoff turns uncached.
 type Message struct {
-	Role       string     `json:"role"` // "system" | "user" | "assistant" | "tool"
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role            string     `json:"role"` // "system" | "user" | "assistant" | "tool"
+	Content         string     `json:"content,omitempty"`
+	ToolCalls       []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID      string     `json:"tool_call_id,omitempty"`
+	Name            string     `json:"name,omitempty"`
+	CacheBreakpoint bool       `json:"-"`
 }
 
 // Tool is one function-tool definition.

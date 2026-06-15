@@ -1,8 +1,6 @@
 package providers
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,10 +21,7 @@ import (
 //   - Tools translate function-name + JSON-schema parameters into
 //     Anthropic's input_schema.
 type Anthropic struct {
-	apiKey  string
-	baseURL string
-	headers map[string]string
-	client  *http.Client
+	t transport
 }
 
 // AnthropicConfig contains construction parameters.
@@ -47,11 +42,21 @@ func NewAnthropic(cfg AnthropicConfig) *Anthropic {
 	if c == nil {
 		c = &http.Client{Timeout: 0} // streaming needs no overall timeout; context handles it
 	}
+	// Anthropic requires the version header on every request; fold it
+	// into the per-provider default headers.
+	headers := map[string]string{"anthropic-version": "2023-06-01"}
+	for k, v := range cfg.Headers {
+		headers[k] = v
+	}
 	return &Anthropic{
-		apiKey:  cfg.APIKey,
-		baseURL: strings.TrimRight(base, "/"),
-		headers: cfg.Headers,
-		client:  c,
+		t: transport{
+			client:     c,
+			baseURL:    strings.TrimRight(base, "/"),
+			headers:    headers,
+			authHeader: "x-api-key",
+			authValue:  cfg.APIKey,
+			name:       "anthropic",
+		},
 	}
 }
 
@@ -64,19 +69,11 @@ func (a *Anthropic) Complete(ctx context.Context, req CompletionRequest) (*Compl
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := a.newRequest(ctx, body)
+	resp, err := a.t.post(ctx, "/v1/messages", body, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := a.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic http: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode/100 != 2 {
-		return nil, readError(resp, "anthropic")
-	}
 
 	var msg anthropicMessage
 	if err := json.NewDecoder(resp.Body).Decode(&msg); err != nil {
@@ -85,51 +82,19 @@ func (a *Anthropic) Complete(ctx context.Context, req CompletionRequest) (*Compl
 	return msg.toCompletionResponse(), nil
 }
 
-// Stream runs a streaming Messages API call, emitting deltas to sink.
-func (a *Anthropic) Stream(ctx context.Context, req CompletionRequest, sink StreamSink) error {
+// Stream runs a streaming Messages API call, emitting deltas to sink and
+// returning the usage reported across message_start and message_delta.
+func (a *Anthropic) Stream(ctx context.Context, req CompletionRequest, sink Sink) (Usage, error) {
 	body, err := buildAnthropicRequest(req, true)
 	if err != nil {
-		return err
+		return Usage{}, err
 	}
-	httpReq, err := a.newRequest(ctx, body)
+	resp, err := a.t.post(ctx, "/v1/messages", body, http.Header{"Accept": []string{"text/event-stream"}})
 	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-
-	resp, err := a.client.Do(httpReq)
-	if err != nil {
-		return fmt.Errorf("anthropic http: %w", err)
+		return Usage{}, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode/100 != 2 {
-		return readError(resp, "anthropic")
-	}
 	return parseAnthropicStream(resp.Body, sink)
-}
-
-func (a *Anthropic) newRequest(ctx context.Context, body []byte) (*http.Request, error) {
-	url := a.baseURL + "/v1/messages"
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("x-api-key", a.apiKey)
-	r.Header.Set("anthropic-version", "2023-06-01")
-	for k, v := range a.headers {
-		r.Header.Set(k, v)
-	}
-	return r, nil
-}
-
-// readError reads up to 4KiB of an error body and wraps it.
-func readError(resp *http.Response, provider string) error {
-	const maxErrBody = 4096
-	limited := io.LimitReader(resp.Body, maxErrBody)
-	b, _ := io.ReadAll(limited)
-	return fmt.Errorf("%s http %d: %s", provider, resp.StatusCode, strings.TrimSpace(string(b)))
 }
 
 // --- Request translation ---
@@ -159,15 +124,22 @@ type anthropicMessage struct {
 }
 
 type anthropicBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"` // tool_result content
+	Type         string             `json:"type"`
+	Text         string             `json:"text,omitempty"`
+	ID           string             `json:"id,omitempty"`
+	Name         string             `json:"name,omitempty"`
+	Input        json.RawMessage    `json:"input,omitempty"`
+	ToolUseID    string             `json:"tool_use_id,omitempty"`
+	Content      json.RawMessage    `json:"content,omitempty"` // tool_result content
+	CacheControl *anthropicCacheCtl `json:"cache_control,omitempty"`
 	// streaming-only:
 	PartialJSON string `json:"partial_json,omitempty"`
+}
+
+// anthropicCacheCtl is the cache_control directive placed on the last block
+// of a prefix to mark it cacheable.
+type anthropicCacheCtl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 type anthropicTool struct {
@@ -177,8 +149,10 @@ type anthropicTool struct {
 }
 
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
 
 func buildAnthropicRequest(req CompletionRequest, stream bool) ([]byte, error) {
@@ -277,7 +251,46 @@ func buildAnthropicRequest(req CompletionRequest, stream bool) ([]byte, error) {
 		}
 	}
 
+	if req.CachePrefix {
+		markAnthropicCachePrefix(&out, cacheBreakpointIndex(msgs))
+	}
+
 	return json.Marshal(out)
+}
+
+// cacheBreakpointIndex returns the index into the translated (non-system)
+// message slice that should carry the cache marker. If a message has
+// CacheBreakpoint set, that one wins; otherwise the last message is used.
+// Returns -1 when there are no messages.
+func cacheBreakpointIndex(msgs []Message) int {
+	idx := len(msgs) - 1
+	for i, m := range msgs {
+		if m.CacheBreakpoint {
+			idx = i
+		}
+	}
+	return idx
+}
+
+// markAnthropicCachePrefix places a single ephemeral cache_control breakpoint
+// on the last content block of the message at idx. Anthropic caches
+// everything up to and including that block — system prompt, tools, and all
+// prior messages. Subsequent requests with the same prefix get a cache read.
+//
+// Marking a message rather than the system block lets the cached span cover
+// the (large) conversation history, where the token volume lives. Tools and
+// system are implicitly included because they precede the messages in the
+// cache key. The fusion pipeline sets the breakpoint on the last original
+// message so the appended handoff turns stay outside the cached prefix.
+func markAnthropicCachePrefix(out *anthropicRequest, idx int) {
+	if idx < 0 || idx >= len(out.Messages) {
+		return
+	}
+	msg := &out.Messages[idx]
+	if len(msg.Content) == 0 {
+		return
+	}
+	msg.Content[len(msg.Content)-1].CacheControl = &anthropicCacheCtl{Type: "ephemeral"}
 }
 
 // translateToolChoice converts an OpenAI-shaped tool_choice into Anthropic's
@@ -391,13 +404,23 @@ func (m *anthropicMessage) toCompletionResponse() *CompletionResponse {
 	}
 	out.FinishReason = mapStopReason(m.StopReason)
 	if m.Usage != nil {
-		out.Usage = Usage{
-			PromptTokens:     m.Usage.InputTokens,
-			CompletionTokens: m.Usage.OutputTokens,
-			TotalTokens:      m.Usage.InputTokens + m.Usage.OutputTokens,
-		}
+		out.Usage = m.Usage.toUsage()
 	}
 	return out
+}
+
+// toUsage converts Anthropic's usage block to the provider-agnostic Usage.
+// Anthropic reports cache_read_input_tokens and cache_creation_input_tokens
+// separately from input_tokens; input_tokens already excludes cached reads,
+// so PromptTokens is the uncached input and the cache fields are additive.
+func (u *anthropicUsage) toUsage() Usage {
+	return Usage{
+		PromptTokens:        u.InputTokens,
+		CompletionTokens:    u.OutputTokens,
+		TotalTokens:         u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
+		CacheReadTokens:     u.CacheReadInputTokens,
+		CacheCreationTokens: u.CacheCreationInputTokens,
+	}
 }
 
 func mapStopReason(s string) string {
@@ -429,121 +452,110 @@ func mapStopReason(s string) string {
 //   message_delta              -> stop_reason + usage output tokens
 //   message_stop               -> end of stream
 //   ping                       -> ignore
-func parseAnthropicStream(body io.Reader, sink StreamSink) error {
-	scanner := bufio.NewScanner(body)
-	// SSE lines can be long; raise the buffer.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+// errStreamDone is a sentinel returned by an scanSSE handler to indicate
+// the stream has logically completed (a terminal event was received) and
+// scanning should stop without further error.
+var errStreamDone = errors.New("stream done")
 
+func parseAnthropicStream(body io.Reader, sink Sink) (Usage, error) {
 	var (
 		stopReason string
-		// Track active block: index, type, and (for tool_use) the tool call delta state.
-		blockTypes = map[int]string{}
-		toolCalls  = map[int]*ToolCallDelta{}
+		usage      anthropicUsage
 	)
-
-	var eventName string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			eventName = ""
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue // SSE comment / keepalive
-		}
-		if strings.HasPrefix(line, "event:") {
-			eventName = strings.TrimSpace(line[len("event:"):])
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(line[len("data:"):])
-		if data == "" {
-			continue
-		}
-
-		switch eventName {
+	err := scanSSE(body, func(ev sseEvent) error {
+		switch ev.Event {
+		case "content_block_stop", "ping", "":
+			return nil
 		case "message_start":
-			// ignore for now; could surface usage
+			// input_tokens and cache_* counts arrive here.
+			var p struct {
+				Message struct {
+					Usage anthropicUsage `json:"usage"`
+				} `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(ev.Data), &p); err == nil {
+				usage.InputTokens = p.Message.Usage.InputTokens
+				usage.CacheReadInputTokens = p.Message.Usage.CacheReadInputTokens
+				usage.CacheCreationInputTokens = p.Message.Usage.CacheCreationInputTokens
+			}
+			return nil
 		case "content_block_start":
-			var ev struct {
-				Index        int            `json:"index"`
-				ContentBlock anthropicBlock `json:"content_block"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err != nil {
-				return fmt.Errorf("anthropic stream content_block_start: %w", err)
-			}
-			blockTypes[ev.Index] = ev.ContentBlock.Type
-			if ev.ContentBlock.Type == "tool_use" {
-				tcd := &ToolCallDelta{
-					Index:        ev.Index,
-					ID:           ev.ContentBlock.ID,
-					FunctionName: ev.ContentBlock.Name,
-				}
-				toolCalls[ev.Index] = tcd
-				if err := sink.Delta(Delta{ToolCallDelta: tcd}); err != nil {
-					return err
-				}
-			}
+			return anthropicHandleBlockStart(ev.Data, sink)
 		case "content_block_delta":
-			var ev struct {
-				Index int `json:"index"`
-				Delta struct {
-					Type        string `json:"type"`
-					Text        string `json:"text,omitempty"`
-					PartialJSON string `json:"partial_json,omitempty"`
-				} `json:"delta"`
-			}
-			if err := json.Unmarshal([]byte(data), &ev); err != nil {
-				return fmt.Errorf("anthropic stream content_block_delta: %w", err)
-			}
-			switch ev.Delta.Type {
-			case "text_delta":
-				if ev.Delta.Text != "" {
-					if err := sink.Delta(Delta{Content: ev.Delta.Text}); err != nil {
-						return err
-					}
-				}
-			case "input_json_delta":
-				if ev.Delta.PartialJSON != "" {
-					if err := sink.Delta(Delta{ToolCallDelta: &ToolCallDelta{
-						Index:            ev.Index,
-						ArgumentsPartial: ev.Delta.PartialJSON,
-					}}); err != nil {
-						return err
-					}
-				}
-			}
-		case "content_block_stop":
-			// nothing to emit
+			return anthropicHandleBlockDelta(ev.Data, sink)
 		case "message_delta":
-			var ev struct {
+			// stop_reason and output_tokens arrive here.
+			var p struct {
 				Delta struct {
 					StopReason string `json:"stop_reason"`
 				} `json:"delta"`
+				Usage anthropicUsage `json:"usage"`
 			}
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if ev.Delta.StopReason != "" {
-					stopReason = ev.Delta.StopReason
+			if err := json.Unmarshal([]byte(ev.Data), &p); err == nil {
+				if p.Delta.StopReason != "" {
+					stopReason = p.Delta.StopReason
+				}
+				if p.Usage.OutputTokens > 0 {
+					usage.OutputTokens = p.Usage.OutputTokens
 				}
 			}
+			return nil
 		case "message_stop":
-			return sink.Done(mapStopReason(stopReason))
-		case "ping", "":
-			// ignore
-		default:
-			// Unknown event; ignore for forward compatibility.
+			return errStreamDone
+		}
+		// Unknown event: ignore for forward compatibility.
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStreamDone) {
+		return Usage{}, err
+	}
+	return usage.toUsage(), sink.Done(mapStopReason(stopReason))
+}
+
+func anthropicHandleBlockStart(data string, sink Sink) error {
+	var ev struct {
+		Index        int            `json:"index"`
+		ContentBlock anthropicBlock `json:"content_block"`
+	}
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		return fmt.Errorf("anthropic stream content_block_start: %w", err)
+	}
+	if ev.ContentBlock.Type != "tool_use" {
+		return nil
+	}
+	return sink.Delta(Delta{ToolCallDelta: &ToolCallDelta{
+		Index:        ev.Index,
+		ID:           ev.ContentBlock.ID,
+		FunctionName: ev.ContentBlock.Name,
+	}})
+}
+
+func anthropicHandleBlockDelta(data string, sink Sink) error {
+	var ev struct {
+		Index int `json:"index"`
+		Delta struct {
+			Type        string `json:"type"`
+			Text        string `json:"text,omitempty"`
+			PartialJSON string `json:"partial_json,omitempty"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		return fmt.Errorf("anthropic stream content_block_delta: %w", err)
+	}
+	switch ev.Delta.Type {
+	case "text_delta":
+		if ev.Delta.Text != "" {
+			return sink.Delta(Delta{Content: ev.Delta.Text})
+		}
+	case "input_json_delta":
+		if ev.Delta.PartialJSON != "" {
+			return sink.Delta(Delta{ToolCallDelta: &ToolCallDelta{
+				Index:            ev.Index,
+				ArgumentsPartial: ev.Delta.PartialJSON,
+			}})
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
-		return fmt.Errorf("anthropic stream scan: %w", err)
-	}
-	// Stream ended without message_stop; treat as a normal finish.
-	return sink.Done(mapStopReason(stopReason))
+	return nil
 }
 
 // Compile-time check.

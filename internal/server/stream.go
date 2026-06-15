@@ -206,33 +206,31 @@ func (s *SSEWriter) sendRaw(raw string) error {
 	return nil
 }
 
-// StreamSink adapts SSEWriter to providers.StreamSink.
-type StreamSink struct {
-	SSE              *SSEWriter
-	EmitReasoning    bool
+// sseSink adapts SSEWriter to providers.Sink. This is the single adapter
+// between the SSE wire and everything upstream (providers and pipeline).
+type sseSink struct {
+	sse           *SSEWriter
+	emitReasoning bool
 }
 
-// Delta implements providers.StreamSink.
-func (s *StreamSink) Delta(d providers.Delta) error {
-	if d.Content != "" {
-		if err := s.SSE.SendContent(d.Content); err != nil {
-			return err
+// Delta implements providers.Sink. ReasoningContent deltas are dropped
+// when emitReasoning is false (some clients can't render them).
+func (s *sseSink) Delta(d providers.Delta) error {
+	switch {
+	case d.Content != "":
+		return s.sse.SendContent(d.Content)
+	case d.ReasoningContent != "":
+		if !s.emitReasoning {
+			return nil
 		}
-	}
-	if d.ReasoningContent != "" && s.EmitReasoning {
-		if err := s.SSE.SendReasoning(d.ReasoningContent); err != nil {
-			return err
-		}
-	}
-	if d.ToolCallDelta != nil {
-		if err := s.SSE.SendToolCallDelta(*d.ToolCallDelta); err != nil {
-			return err
-		}
+		return s.sse.SendReasoning(d.ReasoningContent)
+	case d.ToolCallDelta != nil:
+		return s.sse.SendToolCallDelta(*d.ToolCallDelta)
 	}
 	return nil
 }
 
-// Done implements providers.StreamSink.
-func (s *StreamSink) Done(reason string) error {
-	return s.SSE.SendFinish(reason)
+// Done implements providers.Sink.
+func (s *sseSink) Done(reason string) error {
+	return s.sse.SendFinish(reason)
 }

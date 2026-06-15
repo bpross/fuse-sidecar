@@ -19,11 +19,12 @@
       "primary": {
         "provider": "anthropic",
         "model": "claude-opus-4-7",
-        "temperature": 0.2
+        "temperature": 0.2,
+        "cache": "ephemeral"
       },
       "panel": [
-        { "provider": "anthropic", "model": "claude-opus-4-7" },
-        { "provider": "anthropic", "model": "claude-sonnet-4-5" },
+        { "provider": "anthropic", "model": "claude-opus-4-7", "cache": "ephemeral" },
+        { "provider": "anthropic", "model": "claude-sonnet-4-5", "cache": "ephemeral" },
         { "provider": "openai",    "model": "gpt-5", "max_tokens": 16384 }
       ],
       "judge": {
@@ -39,10 +40,11 @@
       "primary": {
         "provider": "anthropic",
         "model": "claude-sonnet-4-5",
-        "temperature": 0.2
+        "temperature": 0.2,
+        "cache": "ephemeral"
       },
       "panel": [
-        { "provider": "anthropic", "model": "claude-sonnet-4-5" },
+        { "provider": "anthropic", "model": "claude-sonnet-4-5", "cache": "ephemeral" },
         { "provider": "openai",    "model": "gpt-5", "max_tokens": 16384 }
       ],
       "judge": {

@@ -84,6 +84,19 @@ type Endpoint struct {
 	Model       string   `json:"model"`
 	Temperature *float64 `json:"temperature,omitempty"`
 	MaxTokens   *int     `json:"max_tokens,omitempty"`
+
+	// Cache opts this endpoint into provider prompt caching. Currently only
+	// "ephemeral" (Anthropic's 5-minute prefix cache) is meaningful; any
+	// other value (including "") disables explicit caching. Providers that
+	// don't support cache markers ignore it. The biggest win is on the
+	// primary endpoint, where the speculative call writes the cache and the
+	// final-primary call reads the same conversation prefix back.
+	Cache string `json:"cache,omitempty"`
+}
+
+// CacheEnabled reports whether this endpoint requested prompt caching.
+func (e Endpoint) CacheEnabled() bool {
+	return e.Cache == "ephemeral"
 }
 
 // Load reads, parses, and validates a config file. Tilde in LogDir is expanded.

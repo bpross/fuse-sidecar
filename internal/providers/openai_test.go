@@ -109,7 +109,7 @@ func TestOpenAIStreamHappyPath(t *testing.T) {
 
 	o := NewOpenAI(OpenAIConfig{APIKey: "k", BaseURL: srv.URL})
 	sink := &captureSink{}
-	if err := o.Stream(context.Background(), CompletionRequest{
+	if _, err := o.Stream(context.Background(), CompletionRequest{
 		Model:    "gpt-5",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	}, sink); err != nil {
@@ -145,7 +145,7 @@ func TestOpenAIStreamToolCallDeltas(t *testing.T) {
 
 	o := NewOpenAI(OpenAIConfig{APIKey: "k", BaseURL: srv.URL})
 	sink := &captureSink{}
-	if err := o.Stream(context.Background(), CompletionRequest{
+	if _, err := o.Stream(context.Background(), CompletionRequest{
 		Model:    "gpt-5",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	}, sink); err != nil {
@@ -219,6 +219,76 @@ func TestOpenAIMaxCompletionTokensRouting(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOpenAICompleteCacheUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+		  "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+		  "usage":{"prompt_tokens":5000,"completion_tokens":20,"total_tokens":5020,"prompt_tokens_details":{"cached_tokens":4500}}
+		}`)
+	}))
+	defer srv.Close()
+
+	o := NewOpenAI(OpenAIConfig{APIKey: "k", BaseURL: srv.URL})
+	resp, err := o.Complete(context.Background(), CompletionRequest{
+		Model:    "gpt-5",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// prompt_tokens includes cached; we subtract so PromptTokens is uncached.
+	if resp.Usage.PromptTokens != 500 {
+		t.Errorf("uncached prompt = %d, want 500", resp.Usage.PromptTokens)
+	}
+	if resp.Usage.CacheReadTokens != 4500 {
+		t.Errorf("cache_read = %d", resp.Usage.CacheReadTokens)
+	}
+}
+
+func TestOpenAIStreamUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+		``,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: {"choices":[],"usage":{"prompt_tokens":3000,"completion_tokens":15,"total_tokens":3015,"prompt_tokens_details":{"cached_tokens":2000}}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Confirm we asked for usage on the stream.
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"include_usage":true`) {
+			t.Errorf("stream request missing include_usage: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse)
+	}))
+	defer srv.Close()
+
+	o := NewOpenAI(OpenAIConfig{APIKey: "k", BaseURL: srv.URL})
+	sink := &captureSink{}
+	usage, err := o.Stream(context.Background(), CompletionRequest{
+		Model:    "gpt-5",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.PromptTokens != 1000 {
+		t.Errorf("uncached prompt = %d, want 1000", usage.PromptTokens)
+	}
+	if usage.CacheReadTokens != 2000 {
+		t.Errorf("cache_read = %d", usage.CacheReadTokens)
+	}
+	if usage.CompletionTokens != 15 {
+		t.Errorf("output = %d", usage.CompletionTokens)
 	}
 }
 

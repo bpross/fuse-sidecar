@@ -68,7 +68,7 @@ func TestPipelinePassthroughOnToolCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.Kind != DecisionPassthrough {
+	if dec.Kind != DecisionToolCall {
 		t.Errorf("kind = %s, want passthrough", dec.Kind)
 	}
 	if !sink.done || sink.finish != "tool_calls" {
@@ -194,6 +194,49 @@ func TestPipelinePanelFailureUsesSpeculativeAsPanelist(t *testing.T) {
 // passing tools through causes them to emit tool_call responses we can't
 // satisfy. The conversation already contains the tool_call/tool_result
 // pairs from the primary's investigation; that's enough context.
+func TestPipelineCachePrefixFlags(t *testing.T) {
+	prov := &fakeProvider{
+		name: "test",
+		completeByModel: map[string]*providers.CompletionResponse{
+			"primary": {Content: "speculative", FinishReason: "stop"},
+			"panel-a": {Content: "panel", FinishReason: "stop"},
+			"judge":   {Content: `{"consensus":["a"],"contradictions":[],"partial":[]}`, FinishReason: "stop"},
+		},
+		streamChunks: []providers.Delta{{Content: "Final."}},
+		streamFinish: "stop",
+	}
+	reg := providers.NewRegistry()
+	reg.Register(prov)
+	p := &Pipeline{Registry: reg, Logger: discardLogger()}
+	sink := &captureSink{}
+
+	_, err := p.Run(context.Background(), config.Model{
+		Primary:         config.Endpoint{Provider: "test", Model: "primary", Cache: "ephemeral"},
+		Panel:           []config.Endpoint{{Provider: "test", Model: "panel-a", Cache: "ephemeral"}},
+		Judge:           config.Endpoint{Provider: "test", Model: "judge"}, // no cache
+		PanelTimeoutMs:  5000,
+		PanelMinSuccess: 1,
+	}, providers.CompletionRequest{
+		Messages: []providers.Message{{Role: "user", Content: "go"}},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Speculative (primary) call should request a cache prefix.
+	if !prov.lastReq["primary"].CachePrefix {
+		t.Errorf("speculative call should set CachePrefix")
+	}
+	// Panel call should request a cache prefix.
+	if !prov.lastReq["panel-a"].CachePrefix {
+		t.Errorf("panel call should set CachePrefix")
+	}
+	// Judge has no cache configured — should not request a prefix.
+	if prov.lastReq["judge"].CachePrefix {
+		t.Errorf("judge call should not set CachePrefix")
+	}
+}
+
 func TestPipelinePanelStripsTools(t *testing.T) {
 	prov := &fakeProvider{
 		name: "test",
@@ -331,8 +374,8 @@ func TestPipelinePanelAllFailAndSpeculativeEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.Kind != DecisionFallback || dec.FallbackReason != "panel_insufficient" {
-		t.Errorf("kind=%s reason=%s, want fallback/panel_insufficient", dec.Kind, dec.FallbackReason)
+	if dec.Kind != DecisionDegraded || dec.FallbackReason != "panel_insufficient" {
+		t.Errorf("kind=%s reason=%s, want degraded/panel_insufficient", dec.Kind, dec.FallbackReason)
 	}
 }
 
@@ -368,7 +411,7 @@ func TestPipelineFallbackOnJudgeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.Kind != DecisionFallback || dec.FallbackReason != "judge_failed" {
+	if dec.Kind != DecisionDegraded || dec.FallbackReason != "judge_failed" {
 		t.Errorf("kind=%s reason=%s", dec.Kind, dec.FallbackReason)
 	}
 	if !strings.Contains(strings.Join(sink.contents, ""), "speculative") {
@@ -494,6 +537,7 @@ type fakeProvider struct {
 
 	streamChunks []providers.Delta
 	streamFinish string
+	streamUsage  providers.Usage
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -529,42 +573,40 @@ func (f *fakeProvider) Complete(_ context.Context, req providers.CompletionReque
 	return f.completeResp, nil
 }
 
-func (f *fakeProvider) Stream(_ context.Context, req providers.CompletionRequest, sink providers.StreamSink) error {
+func (f *fakeProvider) Stream(_ context.Context, req providers.CompletionRequest, sink providers.Sink) (providers.Usage, error) {
 	f.mu.Lock()
 	chunks := f.streamChunks
 	finish := f.streamFinish
+	usage := f.streamUsage
 	f.mu.Unlock()
 	for _, c := range chunks {
 		if err := sink.Delta(c); err != nil {
-			return err
+			return usage, err
 		}
 	}
 	if finish == "" {
 		finish = "stop"
 	}
-	return sink.Done(finish)
+	return usage, sink.Done(finish)
 }
 
 type captureSink struct {
-	contents   []string
-	progress   []string
-	toolCalls  []providers.ToolCallDelta
-	done       bool
-	finish     string
+	contents  []string
+	progress  []string
+	toolCalls []providers.ToolCallDelta
+	done      bool
+	finish    string
 }
 
-func (c *captureSink) Progress(text string) error {
-	c.progress = append(c.progress, text)
-	return nil
-}
-
-func (c *captureSink) Content(text string) error {
-	c.contents = append(c.contents, text)
-	return nil
-}
-
-func (c *captureSink) ToolCallDelta(d providers.ToolCallDelta) error {
-	c.toolCalls = append(c.toolCalls, d)
+func (c *captureSink) Delta(d providers.Delta) error {
+	switch {
+	case d.Content != "":
+		c.contents = append(c.contents, d.Content)
+	case d.ReasoningContent != "":
+		c.progress = append(c.progress, d.ReasoningContent)
+	case d.ToolCallDelta != nil:
+		c.toolCalls = append(c.toolCalls, *d.ToolCallDelta)
+	}
 	return nil
 }
 

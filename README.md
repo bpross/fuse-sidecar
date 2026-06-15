@@ -118,10 +118,67 @@ See `config.example.json` for a full annotated example. Key fields:
   - `panel_timeout_ms` — wall-clock cap for the panel fan-out (default 25000).
   - `panel_min_success` — minimum successful panel responses required to
     proceed to the judge (default 2). Below this, falls back to speculative.
+- Each endpoint (`primary`, `panel[]`, `judge`) takes:
+  - `provider` / `model` — required.
+  - `temperature` — optional sampling override (omit for models that reject it).
+  - `max_tokens` — optional per-endpoint output cap. Useful for reasoning
+    models (gpt-5, o-series) that burn budget thinking before emitting text.
+  - `cache` — set to `"ephemeral"` to opt into Anthropic prompt caching on
+    that endpoint. See [Token caching](#token-caching) below.
 
 Validation runs at startup and fails fast: unknown providers, unset API key
 envs, panels with fewer than 1 entry, and `panel_min_success` exceeding panel
 size all abort startup with a concrete error.
+
+## Token caching
+
+A single fusion turn re-reads the same conversation prefix several times: once
+for the speculative call, once per panel member, and once for the final
+primary call. On a real planning turn the prefix is 50k+ tokens, so a 2-model
+panel ships roughly 5× that prefix for the same bytes. Most of that is wasted.
+
+Set `"cache": "ephemeral"` on an endpoint to opt into prompt caching:
+
+```jsonc
+"primary": { "provider": "anthropic", "model": "claude-opus-4-7", "cache": "ephemeral" }
+```
+
+What it does, by provider:
+
+- **Anthropic** — the sidecar places a `cache_control: {type: "ephemeral"}`
+  breakpoint on the conversation prefix. The speculative call writes the
+  cache; the final primary call reads the same prefix back (a near-guaranteed
+  hit, since it runs seconds later on the same model). Cache reads bill at 10%
+  of normal input price; the write carries a 25% premium. Net effect on a
+  2-model panel: roughly **60-70% less input spend** on the cached prefix,
+  plus lower latency (cached prefills are skipped). The cache TTL is 5 minutes
+  — a session that idles longer than that between the speculative and final
+  call will see the cache expire and re-write.
+- **OpenAI** — caching is automatic and needs no opt-in; the sidecar always
+  reads back `prompt_tokens_details.cached_tokens` so you can see it working.
+  The `cache` field is ignored for OpenAI endpoints.
+
+Panel members share a prefix cache *with each other* (the first member writes,
+the rest read) but not with the speculative call — the panel strips tools, so
+its prefix differs. Stripping tools is deliberate: it stops panel members from
+wasting a completion emitting tool calls they can't execute. The cross-call
+cache win on the primary (speculative → final) is the larger one.
+
+Every turn records its token spend in the snapshot and `/admin/status`:
+
+```json
+"usage": {
+  "input_tokens": 51234,
+  "output_tokens": 1820,
+  "cache_read_tokens": 102468,
+  "cache_creation_tokens": 51234
+}
+```
+
+A high `cache_read_tokens` relative to `input_tokens` means caching is doing
+its job. The same numbers feed `/metrics` as `fuse_input_tokens_total`,
+`fuse_output_tokens_total`, `fuse_cache_read_tokens_total`, and
+`fuse_cache_creation_tokens_total`, all labeled by model and decision.
 
 ## Hot reload
 
@@ -132,13 +189,16 @@ keep the old config running and log the error.
 
 ## Snapshots
 
-Each fusion or fallback decision writes a JSON snapshot to
+Each decision writes a JSON snapshot to
 `<log_dir>/runs/<timestamp>-<request_id>.json` containing:
 
-- The decision (passthrough, fusion, or fallback) and the fallback reason
-- Per-panel-member provider, model, latency, success/error
+- The decision (`tool_call`, `fusion`, `degraded`, or `failed`) and the
+  fallback reason when degraded/failed
+- Per-panel-member provider, model, latency, attempts, success/error, and
+  per-call token usage
 - Judge analysis JSON
 - Total latency in ms
+- A per-turn token `usage` rollup (input / output / cache read / cache creation)
 
 These are pruned to `snapshot_retention` by lexicographic order.
 

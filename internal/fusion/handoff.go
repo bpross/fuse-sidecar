@@ -17,6 +17,14 @@ func buildHandoffMessages(original []providers.Message, analysis *JudgeAnalysis)
 	out := make([]providers.Message, 0, len(original)+2)
 	out = append(out, original...)
 
+	// Mark the last original message as the cache breakpoint so a
+	// cache-aware provider caches the conversation prefix shared with the
+	// speculative call. The two synthetic turns appended below sit after
+	// the breakpoint and stay out of the cached span.
+	if len(out) > 0 {
+		out[len(out)-1].CacheBreakpoint = true
+	}
+
 	compact, err := json.Marshal(analysis)
 	if err != nil {
 		// JudgeAnalysis is plain types; marshaling cannot realistically

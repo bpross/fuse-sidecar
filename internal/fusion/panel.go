@@ -3,8 +3,9 @@ package fusion
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/bpross/fuse-sidecar/internal/config"
 	"github.com/bpross/fuse-sidecar/internal/providers"
@@ -43,6 +44,12 @@ const panelRetryFloor = 8192
 //
 // The returned slice is in the same order as the input endpoints. Members
 // that did not complete before the cap have Err == context.DeadlineExceeded.
+//
+// We use errgroup for the fan-out. Per-task errors are recorded on the
+// per-task PanelMemberResult, not returned through the group — every task
+// must run to completion (or context cancellation) so we can record per-task
+// latencies even when other members are slow. The group's own error return
+// is therefore always nil; we discard it.
 func runPanel(
 	ctx context.Context,
 	reg *providers.Registry,
@@ -51,10 +58,10 @@ func runPanel(
 	timeout time.Duration,
 ) []PanelMemberResult {
 	results := make([]PanelMemberResult, len(endpoints))
-	var wg sync.WaitGroup
 	panelCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	g, gCtx := errgroup.WithContext(panelCtx)
 	for i, ep := range endpoints {
 		i, ep := i, ep
 		results[i].Endpoint = ep
@@ -63,15 +70,14 @@ func runPanel(
 			results[i].Err = fmt.Errorf("provider %q not registered", ep.Provider)
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		g.Go(func() error {
 			started := time.Now()
-			results[i] = callPanelMember(panelCtx, prov, ep, base, results[i])
+			results[i] = callPanelMember(gCtx, prov, ep, base, results[i])
 			results[i].Latency = time.Since(started)
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
+	_ = g.Wait()
 	return results
 }
 
@@ -86,6 +92,13 @@ func runPanel(
 // burning tokens and producing zero usable text. The conversation history
 // already contains the tool_call/tool_result pairs from the primary's
 // investigation, so panel members see what was found and can reason from it.
+//
+// Caching: because every panel member sends the identical (tools-stripped)
+// prefix, the first member writes the provider's prefix cache and the rest
+// read it. We do NOT share the speculative call's cache here — that call
+// carries tools, so its prefix differs. Stripping tools is worth more than
+// the cross-call cache hit because it prevents panel members from wasting a
+// whole completion emitting unservable tool calls.
 func callPanelMember(
 	ctx context.Context,
 	prov providers.Provider,

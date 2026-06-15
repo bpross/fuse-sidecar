@@ -344,7 +344,7 @@ func TestAnthropicStreamHappyPath(t *testing.T) {
 
 	a := NewAnthropic(AnthropicConfig{APIKey: "k", BaseURL: srv.URL})
 	sink := &captureSink{}
-	if err := a.Stream(context.Background(), CompletionRequest{
+	if _, err := a.Stream(context.Background(), CompletionRequest{
 		Model:    "claude-opus-4-7",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	}, sink); err != nil {
@@ -386,7 +386,7 @@ func TestAnthropicStreamToolUse(t *testing.T) {
 
 	a := NewAnthropic(AnthropicConfig{APIKey: "k", BaseURL: srv.URL})
 	sink := &captureSink{}
-	if err := a.Stream(context.Background(), CompletionRequest{
+	if _, err := a.Stream(context.Background(), CompletionRequest{
 		Model:    "claude-opus-4-7",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	}, sink); err != nil {
@@ -407,6 +407,171 @@ func TestAnthropicStreamToolUse(t *testing.T) {
 	}
 	if args != `{"path":"foo.txt"}` {
 		t.Errorf("accumulated args = %q", args)
+	}
+}
+
+func TestBuildAnthropicRequestCacheMarker(t *testing.T) {
+	// CachePrefix with no explicit breakpoint marks the last message.
+	body, err := buildAnthropicRequest(CompletionRequest{
+		Model: "claude-opus-4-7",
+		Messages: []Message{
+			{Role: "user", Content: "first"},
+			{Role: "assistant", Content: "second"},
+		},
+		CachePrefix: true,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []struct {
+			Content []struct {
+				Text         string          `json:"text"`
+				CacheControl json.RawMessage `json:"cache_control"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	// last message's last block should carry cache_control
+	lastMsg := got.Messages[len(got.Messages)-1]
+	lastBlock := lastMsg.Content[len(lastMsg.Content)-1]
+	if len(lastBlock.CacheControl) == 0 {
+		t.Errorf("expected cache_control on last block, got none")
+	}
+	// first message should NOT carry cache_control
+	if len(got.Messages[0].Content[0].CacheControl) != 0 {
+		t.Errorf("first message should not carry cache_control")
+	}
+}
+
+func TestBuildAnthropicRequestCacheMarkerExplicitBreakpoint(t *testing.T) {
+	// An explicit CacheBreakpoint on an earlier message wins over the last.
+	body, err := buildAnthropicRequest(CompletionRequest{
+		Model: "claude-opus-4-7",
+		Messages: []Message{
+			{Role: "user", Content: "cached prefix", CacheBreakpoint: true},
+			{Role: "assistant", Content: "handoff analysis"},
+			{Role: "user", Content: "now write it"},
+		},
+		CachePrefix: true,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []struct {
+			Content []struct {
+				Text         string          `json:"text"`
+				CacheControl json.RawMessage `json:"cache_control"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages[0].Content[0].CacheControl) == 0 {
+		t.Errorf("breakpoint message should carry cache_control")
+	}
+	for i := 1; i < len(got.Messages); i++ {
+		if len(got.Messages[i].Content[0].CacheControl) != 0 {
+			t.Errorf("message %d (after breakpoint) should not carry cache_control", i)
+		}
+	}
+}
+
+func TestBuildAnthropicRequestNoCacheMarkerWhenDisabled(t *testing.T) {
+	body, err := buildAnthropicRequest(CompletionRequest{
+		Model:    "claude-opus-4-7",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		// CachePrefix not set
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "cache_control") {
+		t.Errorf("should not emit cache_control when CachePrefix is false: %s", body)
+	}
+}
+
+func TestAnthropicCompleteCacheUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+		  "content": [{"type":"text","text":"hi"}],
+		  "stop_reason": "end_turn",
+		  "usage": {
+		    "input_tokens": 100,
+		    "output_tokens": 20,
+		    "cache_read_input_tokens": 5000,
+		    "cache_creation_input_tokens": 0
+		  }
+		}`)
+	}))
+	defer srv.Close()
+
+	a := NewAnthropic(AnthropicConfig{APIKey: "k", BaseURL: srv.URL})
+	resp, err := a.Complete(context.Background(), CompletionRequest{
+		Model:    "claude-opus-4-7",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Usage.PromptTokens != 100 {
+		t.Errorf("prompt = %d", resp.Usage.PromptTokens)
+	}
+	if resp.Usage.CacheReadTokens != 5000 {
+		t.Errorf("cache_read = %d", resp.Usage.CacheReadTokens)
+	}
+	if resp.Usage.CacheCreationTokens != 0 {
+		t.Errorf("cache_creation = %d", resp.Usage.CacheCreationTokens)
+	}
+}
+
+func TestAnthropicStreamUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":4000,"cache_creation_input_tokens":200}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse)
+	}))
+	defer srv.Close()
+
+	a := NewAnthropic(AnthropicConfig{APIKey: "k", BaseURL: srv.URL})
+	sink := &captureSink{}
+	usage, err := a.Stream(context.Background(), CompletionRequest{
+		Model:    "claude-opus-4-7",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.PromptTokens != 100 {
+		t.Errorf("prompt = %d", usage.PromptTokens)
+	}
+	if usage.CacheReadTokens != 4000 {
+		t.Errorf("cache_read = %d", usage.CacheReadTokens)
+	}
+	if usage.CacheCreationTokens != 200 {
+		t.Errorf("cache_creation = %d", usage.CacheCreationTokens)
+	}
+	if usage.CompletionTokens != 42 {
+		t.Errorf("output = %d", usage.CompletionTokens)
 	}
 }
 

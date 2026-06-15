@@ -35,9 +35,14 @@ func NewMetrics() *Metrics {
 
 // Inc bumps a counter by 1. labels is a flat k,v,k,v sequence.
 func (m *Metrics) Inc(name string, labels ...string) {
+	m.Add(name, 1, labels...)
+}
+
+// Add bumps a counter by n. labels is a flat k,v,k,v sequence.
+func (m *Metrics) Add(name string, n int64, labels ...string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.counters[seriesKey(name, labels)]++
+	m.counters[seriesKey(name, labels)] += n
 }
 
 // Observe records a duration sample in milliseconds.

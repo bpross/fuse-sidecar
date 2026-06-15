@@ -67,17 +67,20 @@ Your job is comparison, NOT merging. Return ONLY a JSON object with these keys:
 Be concise. Each entry is a short sentence. Output strictly valid JSON, no prose.`
 
 // runJudge calls the judge provider with the original user prompt and the
-// panel responses, then parses the structured analysis.
+// panel responses, then parses the structured analysis. The returned Usage
+// accumulates token spend across the judge call and any retry.
 func runJudge(
 	ctx context.Context,
 	reg *providers.Registry,
 	ep config.Endpoint,
 	originalMessages []providers.Message,
 	panel PanelSummary,
-) (*JudgeAnalysis, error) {
+) (*JudgeAnalysis, providers.Usage, error) {
+	var usage providers.Usage
+
 	prov, ok := reg.Get(ep.Provider)
 	if !ok {
-		return nil, fmt.Errorf("judge provider %q not registered", ep.Provider)
+		return nil, usage, fmt.Errorf("judge provider %q not registered", ep.Provider)
 	}
 
 	userPrompt := buildJudgeUserPrompt(originalMessages, panel)
@@ -99,31 +102,33 @@ func runJudge(
 
 	resp, err := prov.Complete(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("judge call: %w", err)
+		return nil, usage, fmt.Errorf("judge call: %w", err)
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("judge call: no response returned")
+		return nil, usage, fmt.Errorf("judge call: no response returned")
 	}
+	usage.Add(resp.Usage)
 
 	analysis, err := parseJudgeOutput(resp.Content)
 	if err == nil {
-		return analysis, nil
+		return analysis, usage, nil
 	}
 
 	// Single retry with a stricter system message appended.
 	req.Messages[0].Content += "\n\nIMPORTANT: Your previous response was not valid JSON. Output ONLY a JSON object, nothing else."
 	resp, err2 := prov.Complete(ctx, req)
 	if err2 != nil {
-		return nil, fmt.Errorf("judge retry: %w", err2)
+		return nil, usage, fmt.Errorf("judge retry: %w", err2)
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("judge retry: no response returned")
+		return nil, usage, fmt.Errorf("judge retry: no response returned")
 	}
+	usage.Add(resp.Usage)
 	analysis, err = parseJudgeOutput(resp.Content)
 	if err != nil {
-		return nil, fmt.Errorf("judge output parse: %w", err)
+		return nil, usage, fmt.Errorf("judge output parse: %w", err)
 	}
-	return analysis, nil
+	return analysis, usage, nil
 }
 
 func buildJudgeUserPrompt(originalMessages []providers.Message, panel PanelSummary) string {

@@ -185,7 +185,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// during the panel + judge gap.
 	sse.StartHeartbeat(5 * time.Second)
 
-	sink := &fusionSink{sse: sse, emitReasoning: st.cfg.ReasoningBlocksEnabled}
+	sink := &sseSink{sse: sse, emitReasoning: st.cfg.ReasoningBlocksEnabled}
 	base := translateRequest(req)
 
 	dec, err := st.pipeline.Run(r.Context(), model, base, sink)
@@ -195,13 +195,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		logger.Error("pipeline error", "error", err)
 		_ = sse.SendErrorEvent(fmt.Sprintf("fusion error: %v", err))
 		_ = sse.sendRaw("data: [DONE]\n\n")
-		s.metrics.Inc("fuse_fallback_total", "reason", "pipeline_error")
+		reason := dec.FallbackReason
+		if reason == "" {
+			reason = "pipeline_error"
+		}
+		s.metrics.Inc("fuse_failed_total", "reason", reason)
 		s.recordSnapshot(obs.Snapshot{
 			RequestID:      requestID,
 			Timestamp:      start,
 			ModelID:        req.Model,
-			Decision:       "fallback",
-			FallbackReason: "pipeline_error",
+			Decision:       string(fusion.DecisionFailed),
+			FallbackReason: reason,
 			TotalLatencyMs: latency.Milliseconds(),
 		})
 		return
@@ -219,17 +223,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Panel:            panelResultsToObs(dec.Panel),
 		FinalAnswerBytes: dec.FinalAnswerBytes,
 		FinalAnswerHead:  dec.FinalAnswerHead,
+		Usage:            usageToObs(dec.Usage),
 	}
 	s.recordSnapshot(snap)
 
 	s.metrics.Observe("fuse_total_latency", latency, "model", req.Model, "decision", string(dec.Kind))
+	s.recordUsageMetrics(req.Model, string(dec.Kind), dec.Usage)
 	switch dec.Kind {
-	case fusion.DecisionPassthrough:
-		s.metrics.Inc("fuse_passthrough_total", "model", req.Model)
+	case fusion.DecisionToolCall:
+		s.metrics.Inc("fuse_tool_call_total", "model", req.Model)
 	case fusion.DecisionFusion:
 		s.metrics.Inc("fuse_fusion_total", "model", req.Model)
-	case fusion.DecisionFallback:
-		s.metrics.Inc("fuse_fallback_total", "reason", dec.FallbackReason)
+	case fusion.DecisionDegraded:
+		s.metrics.Inc("fuse_degraded_total", "reason", dec.FallbackReason)
+	case fusion.DecisionFailed:
+		s.metrics.Inc("fuse_failed_total", "reason", dec.FallbackReason)
 	}
 
 	logger.Info("request done",
@@ -237,7 +245,41 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"decision", string(dec.Kind),
 		"fallback_reason", dec.FallbackReason,
 		"latency_ms", latency.Milliseconds(),
+		"input_tokens", dec.Usage.PromptTokens,
+		"output_tokens", dec.Usage.CompletionTokens,
+		"cache_read_tokens", dec.Usage.CacheReadTokens,
+		"cache_creation_tokens", dec.Usage.CacheCreationTokens,
 	)
+}
+
+// usageToObs converts a providers.Usage rollup to the snapshot shape,
+// returning nil when there's nothing to record (keeps snapshots clean for
+// turns that made no upstream calls).
+func usageToObs(u providers.Usage) *obs.Usage {
+	if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.CacheReadTokens == 0 && u.CacheCreationTokens == 0 {
+		return nil
+	}
+	return &obs.Usage{
+		InputTokens:         u.PromptTokens,
+		OutputTokens:        u.CompletionTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+	}
+}
+
+func (s *Server) recordUsageMetrics(model, decision string, u providers.Usage) {
+	if u.PromptTokens > 0 {
+		s.metrics.Add("fuse_input_tokens_total", int64(u.PromptTokens), "model", model, "decision", decision)
+	}
+	if u.CompletionTokens > 0 {
+		s.metrics.Add("fuse_output_tokens_total", int64(u.CompletionTokens), "model", model, "decision", decision)
+	}
+	if u.CacheReadTokens > 0 {
+		s.metrics.Add("fuse_cache_read_tokens_total", int64(u.CacheReadTokens), "model", model, "decision", decision)
+	}
+	if u.CacheCreationTokens > 0 {
+		s.metrics.Add("fuse_cache_creation_tokens_total", int64(u.CacheCreationTokens), "model", model, "decision", decision)
+	}
 }
 
 func (s *Server) recordSnapshot(snap obs.Snapshot) {
@@ -251,12 +293,16 @@ func panelResultsToObs(in []fusion.PanelResult) []obs.PanelResult {
 	out := make([]obs.PanelResult, 0, len(in))
 	for _, r := range in {
 		out = append(out, obs.PanelResult{
-			Provider:  r.Provider,
-			Model:     r.Model,
-			LatencyMs: r.LatencyMs,
-			OK:        r.OK,
-			Error:     r.Error,
-			Attempts:  r.Attempts,
+			Provider:            r.Provider,
+			Model:               r.Model,
+			LatencyMs:           r.LatencyMs,
+			OK:                  r.OK,
+			Error:               r.Error,
+			Attempts:            r.Attempts,
+			InputTokens:         r.InputTokens,
+			OutputTokens:        r.OutputTokens,
+			CacheReadTokens:     r.CacheReadTokens,
+			CacheCreationTokens: r.CacheCreationTokens,
 		})
 	}
 	return out

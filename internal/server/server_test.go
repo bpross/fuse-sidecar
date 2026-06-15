@@ -120,7 +120,7 @@ func TestPassthroughOnToolCalls(t *testing.T) {
 	statusReq := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
 	statusRR := httptest.NewRecorder()
 	s.Handler().ServeHTTP(statusRR, statusReq)
-	if !strings.Contains(statusRR.Body.String(), `"decision":"passthrough"`) {
+	if !strings.Contains(statusRR.Body.String(), `"decision":"tool_call"`) {
 		t.Errorf("status missing passthrough: %s", statusRR.Body.String())
 	}
 }
@@ -173,6 +173,70 @@ func TestFusionEndToEnd(t *testing.T) {
 	s.Handler().ServeHTTP(statusRR, statusReq)
 	if !strings.Contains(statusRR.Body.String(), `"decision":"fusion"`) {
 		t.Errorf("status missing fusion: %s", statusRR.Body.String())
+	}
+}
+
+func TestFusionUsageRollupAndMetrics(t *testing.T) {
+	mp := &mockProvider{
+		completeByModel: map[string]*providers.CompletionResponse{
+			"mock-primary": {Content: "spec", FinishReason: "stop",
+				Usage: providers.Usage{PromptTokens: 100, CompletionTokens: 10, CacheReadTokens: 4000}},
+			"mock-panel-1": {Content: "A", FinishReason: "stop",
+				Usage: providers.Usage{PromptTokens: 50, CompletionTokens: 5, CacheReadTokens: 0, CacheCreationTokens: 1000}},
+			"mock-panel-2": {Content: "B", FinishReason: "stop",
+				Usage: providers.Usage{PromptTokens: 50, CompletionTokens: 5, CacheReadTokens: 1000}},
+			"mock-judge": {Content: `{"consensus":["x"],"contradictions":[],"partial":[]}`, FinishReason: "stop",
+				Usage: providers.Usage{PromptTokens: 200, CompletionTokens: 30}},
+		},
+		streamChunks: []providers.Delta{{Content: "final"}},
+		streamFinish: "stop",
+		streamUsage:  providers.Usage{PromptTokens: 100, CompletionTokens: 500, CacheReadTokens: 4000},
+	}
+
+	s := newTestServerMulti(t, mp)
+	body, _ := json.Marshal(ChatRequest{
+		Model:    "fusion-plan",
+		Stream:   true,
+		Messages: []providers.Message{{Role: "user", Content: "go"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+
+	// Snapshot rollup: input = 100+50+50+200+100 = 500; output = 10+5+5+30+500 = 550;
+	// cache_read = 4000+0+1000+0+4000 = 9000; cache_creation = 1000.
+	statusReq := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
+	statusRR := httptest.NewRecorder()
+	s.Handler().ServeHTTP(statusRR, statusReq)
+	statusBody := statusRR.Body.String()
+	for _, want := range []string{
+		`"input_tokens":500`,
+		`"output_tokens":550`,
+		`"cache_read_tokens":9000`,
+		`"cache_creation_tokens":1000`,
+	} {
+		if !strings.Contains(statusBody, want) {
+			t.Errorf("status usage missing %q in:\n%s", want, statusBody)
+		}
+	}
+
+	// Metrics counters reflect the same rollup.
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRR := httptest.NewRecorder()
+	s.Handler().ServeHTTP(metricsRR, metricsReq)
+	metricsBody := metricsRR.Body.String()
+	for _, want := range []string{
+		`fuse_input_tokens_total{decision="fusion",model="fusion-plan"} 500`,
+		`fuse_output_tokens_total{decision="fusion",model="fusion-plan"} 550`,
+		`fuse_cache_read_tokens_total{decision="fusion",model="fusion-plan"} 9000`,
+		`fuse_cache_creation_tokens_total{decision="fusion",model="fusion-plan"} 1000`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Errorf("metrics missing %q in:\n%s", want, metricsBody)
+		}
 	}
 }
 
@@ -300,6 +364,7 @@ type mockProvider struct {
 
 	streamChunks []providers.Delta
 	streamFinish string
+	streamUsage  providers.Usage
 }
 
 func (m *mockProvider) Name() string { return "mock" }
@@ -316,18 +381,19 @@ func (m *mockProvider) Complete(_ context.Context, req providers.CompletionReque
 	return &providers.CompletionResponse{Content: "default", FinishReason: "stop"}, nil
 }
 
-func (m *mockProvider) Stream(_ context.Context, req providers.CompletionRequest, sink providers.StreamSink) error {
+func (m *mockProvider) Stream(_ context.Context, req providers.CompletionRequest, sink providers.Sink) (providers.Usage, error) {
 	m.mu.Lock()
 	chunks := m.streamChunks
 	finish := m.streamFinish
+	usage := m.streamUsage
 	m.mu.Unlock()
 	for _, c := range chunks {
 		if err := sink.Delta(c); err != nil {
-			return err
+			return usage, err
 		}
 	}
 	if finish == "" {
 		finish = "stop"
 	}
-	return sink.Done(finish)
+	return usage, sink.Done(finish)
 }

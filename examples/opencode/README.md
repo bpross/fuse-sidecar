@@ -128,6 +128,25 @@ because plan-style deliberation shouldn't be the thing that writes to your
 filesystem. Drop those (or set them to `ask`) if you want the fuse agent
 to make changes directly.
 
+## Cost expectations
+
+Fusion is more expensive per finalization turn than a single model: it runs
+the speculative call, N panel calls, a judge call, and the final primary
+call. Tool-call turns during investigation stay cheap (single model, no
+fusion). To keep the finalization cost down, enable Anthropic prompt
+caching by setting `"cache": "ephemeral"` on the Anthropic endpoints in
+your sidecar config — the bundled `config.example.json` already does this.
+
+After a session, the per-turn token spend (including cache hits) is in each
+snapshot:
+
+```sh
+ls -t ~/.local/share/fuse-sidecar/runs/ | head -1 | xargs -I {} \
+  jq '.usage' ~/.local/share/fuse-sidecar/runs/{}
+```
+
+See the top-level README's "Token caching" section for the full picture.
+
 ## Troubleshooting
 
 **"model_not_found" from opencode** — the model IDs under
